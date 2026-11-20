@@ -47,6 +47,16 @@ fn read_campaigns(env: &Env) -> Vec<Address> {
         .unwrap_or_else(|| Vec::new(env))
 }
 
+fn emit_campaign_deployed(env: &Env, creator: &Address, contract: &Address) {
+    env.events().publish(
+        (Symbol::new(env, "campaign_deployed"),),
+        CampaignDeployedEvent {
+            creator: creator.clone(),
+            contract: contract.clone(),
+        },
+    );
+}
+
 #[contract]
 pub struct CampaignFactory;
 
@@ -94,13 +104,7 @@ impl CampaignFactory {
         env.storage().instance().set(&DataKey::Campaigns, &campaigns);
         env.storage().instance().set(&key, &contract_id);
 
-        env.events().publish(
-            (Symbol::new(&env, "campaign_deployed"),),
-            CampaignDeployedEvent {
-                creator: creator.clone(),
-                contract: contract_id.clone(),
-            },
-        );
+        emit_campaign_deployed(&env, &creator, &contract_id);
 
         Ok(contract_id)
     }
