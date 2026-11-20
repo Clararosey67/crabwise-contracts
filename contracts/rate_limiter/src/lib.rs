@@ -286,6 +286,13 @@ impl RateLimiter {
         if record.count > config.limit {
             // The `#[contracterror]` enum cannot carry the offending numbers, so
             // the limit / window / count triple is published here instead.
+            let response = errors::limit_exceeded_response(
+                config.limit,
+                record.count,
+                record.first_ledger,
+                config.window_ledgers,
+                current_ledger,
+            );
             env.events().publish(
                 (Symbol::new(&env, "rl_exceeded"),),
                 (
@@ -294,6 +301,7 @@ impl RateLimiter {
                     record.count,
                     config.limit,
                     config.window_ledgers,
+                    response,
                 ),
             );
             return Err(RateLimitError::LimitExceeded);
