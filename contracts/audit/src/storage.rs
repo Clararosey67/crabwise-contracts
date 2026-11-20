@@ -87,7 +87,13 @@ pub fn load_entry(env: &Env, sequence: u32) -> Option<AuditEntry> {
 /// The caller must pass `sequence == next_sequence(env)`. Because the counter
 /// only ever increases and is only ever bumped here, that sequence has never
 /// been written before, so this cannot clobber an existing entry.
-pub fn write_entry(env: &Env, entry: &AuditEntry) {
+pub fn append_entry(env: &Env, entry: &AuditEntry) {
+    assert_eq!(entry.sequence, next_sequence(env));
+    assert!(!env.storage().persistent().has(&DataKey::Entry(entry.sequence)));
+    write_entry(env, entry);
+}
+
+fn write_entry(env: &Env, entry: &AuditEntry) {
     let entry_key = DataKey::Entry(entry.sequence);
     env.storage().persistent().set(&entry_key, entry);
 

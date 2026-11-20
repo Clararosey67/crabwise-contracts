@@ -267,7 +267,7 @@ impl AuditLog {
             &Some(token),
             status,
         )?;
-        storage::write_entry(&env, &entry);
+        storage::append_entry(&env, &entry);
         env.events().publish(
             (symbol_short!("aud_txn"),),
             (reference, entry.sequence, entry.action, entry.status, entry.amount),
@@ -298,7 +298,7 @@ impl AuditLog {
             &None,
             TxStatus::Activity,
         )?;
-        storage::write_entry(&env, &entry);
+        storage::append_entry(&env, &entry);
         env.events().publish(
             (symbol_short!("aud_act"),),
             (reference, entry.sequence, actor),
