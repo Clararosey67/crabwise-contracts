@@ -1,6 +1,191 @@
 extern crate std;
-use soroban_sdk::Env;
-use crate::{EscrowContract, storage::CommissionStatus, errors::EscrowError};
+
+use soroban_sdk::{
+    symbol_short, testutils::Address as _, testutils::Events as _, token, Address, Bytes, Env,
+    IntoVal, Val,
+};
+
+use crate::{
+    errors::EscrowError,
+    funding_event_tests::{MockConfig, MockConfigClient},
+    storage::CommissionStatus,
+    EscrowContract, EscrowContractClient,
+};
+
+const CLIENT_BALANCE: i128 = 10_000;
+const DEPOSIT: i128 = 1_000;
+
+struct DepositFixture {
+    env: Env,
+    escrow: Address,
+    config: Address,
+    asset: Address,
+    client: Address,
+    artist: Address,
+}
+
+impl DepositFixture {
+    fn new() -> Self {
+        let env = Env::default();
+        env.mock_all_auths();
+
+        let admin = Address::generate(&env);
+        let client = Address::generate(&env);
+        let artist = Address::generate(&env);
+        let wallet = Address::generate(&env);
+        let asset = env
+            .register_stellar_asset_contract_v2(admin.clone())
+            .address();
+        token::StellarAssetClient::new(&env, &asset).mint(&client, &CLIENT_BALANCE);
+
+        let config = env.register_contract(None, MockConfig);
+        MockConfigClient::new(&env, &config).init(&admin, &asset, &wallet);
+        let escrow = env.register_contract(None, EscrowContract);
+        EscrowContractClient::new(&env, &escrow).initialize(&admin);
+
+        Self {
+            env,
+            escrow,
+            config,
+            asset,
+            client,
+            artist,
+        }
+    }
+
+    fn escrow_client(&self) -> EscrowContractClient<'_> {
+        EscrowContractClient::new(&self.env, &self.escrow)
+    }
+
+    fn balances(&self) -> (i128, i128) {
+        let token = token::Client::new(&self.env, &self.asset);
+        (token.balance(&self.client), token.balance(&self.escrow))
+    }
+
+    fn assert_rejected_deposit(&self, id: &Bytes, amount: i128, config: &Address) {
+        let before = self.balances();
+        let events_before = self.env.events().all().len();
+
+        assert_eq!(
+            self.escrow_client()
+                .try_create_escrow(id, &self.client, &self.artist, &amount, config),
+            Err(Ok(EscrowError::InvalidAmount))
+        );
+        assert_eq!(self.env.events().all().len(), events_before);
+        assert_eq!(self.balances(), before);
+    }
+}
+
+#[test]
+fn zero_deposit_preserves_balances_and_leaves_no_record() {
+    let f = DepositFixture::new();
+    let id = Bytes::from_slice(&f.env, b"zero");
+
+    f.assert_rejected_deposit(&id, 0, &f.config);
+    assert!(matches!(
+        f.escrow_client().try_get_escrow(&id),
+        Err(Ok(EscrowError::NotFound))
+    ));
+}
+
+#[test]
+fn negative_deposit_preserves_balances_and_leaves_no_record() {
+    let f = DepositFixture::new();
+    let id = Bytes::from_slice(&f.env, b"negative");
+
+    f.assert_rejected_deposit(&id, -100, &f.config);
+    assert!(matches!(
+        f.escrow_client().try_get_escrow(&id),
+        Err(Ok(EscrowError::NotFound))
+    ));
+}
+
+#[test]
+fn positive_deposit_locks_funds_and_publishes_creation_and_funding_events() {
+    let f = DepositFixture::new();
+    let id = Bytes::from_slice(&f.env, b"positive");
+    let events_before = f.env.events().all().len();
+
+    f.escrow_client()
+        .create_escrow(&id, &f.client, &f.artist, &DEPOSIT, &f.config);
+
+    let created_topics = soroban_sdk::vec![
+        &f.env,
+        symbol_short!("escrow").into_val(&f.env),
+        symbol_short!("created").into_val(&f.env),
+    ];
+    let funded_topics = soroban_sdk::vec![
+        &f.env,
+        symbol_short!("escrow").into_val(&f.env),
+        symbol_short!("funded").into_val(&f.env),
+    ];
+    let mut observed = soroban_sdk::Vec::<(soroban_sdk::Vec<Val>, Val)>::new(&f.env);
+    for (emitter, topics, data) in f.env.events().all().iter().skip(events_before as usize) {
+        if emitter == f.escrow && (topics == created_topics || topics == funded_topics) {
+            observed.push_back((topics, data));
+        }
+    }
+    assert_eq!(
+        observed,
+        soroban_sdk::vec![
+            &f.env,
+            (created_topics, (id.clone(), DEPOSIT).into_val(&f.env)),
+            (
+                funded_topics,
+                (
+                    id.clone(),
+                    f.client.clone(),
+                    DEPOSIT,
+                    f.asset.clone(),
+                    f.env.ledger().sequence(),
+                )
+                    .into_val(&f.env),
+            ),
+        ]
+    );
+
+    assert_eq!(f.balances(), (CLIENT_BALANCE - DEPOSIT, DEPOSIT));
+    let record = f.escrow_client().get_escrow(&id);
+    assert_eq!(record.amount, DEPOSIT);
+    assert_eq!(record.status, CommissionStatus::Locked);
+}
+
+#[test]
+fn nonpositive_deposits_are_rejected_before_config_lookup() {
+    let f = DepositFixture::new();
+    let id = Bytes::from_slice(&f.env, b"missing-config");
+    let missing_config = Address::generate(&f.env);
+
+    for amount in [0, -100] {
+        // A lookup at the unregistered address would fail before a transfer is possible.
+        f.assert_rejected_deposit(&id, amount, &missing_config);
+    }
+}
+
+#[test]
+fn invalid_deposits_leave_existing_escrow_unchanged() {
+    let f = DepositFixture::new();
+    let escrow = f.escrow_client();
+    let existing_id = Bytes::from_slice(&f.env, b"existing");
+    let new_id = Bytes::from_slice(&f.env, b"new");
+    escrow.create_escrow(&existing_id, &f.client, &f.artist, &DEPOSIT, &f.config);
+    let before = escrow.get_escrow(&existing_id);
+
+    f.assert_rejected_deposit(&new_id, -100, &f.config);
+    assert!(matches!(
+        escrow.try_get_escrow(&new_id),
+        Err(Ok(EscrowError::NotFound))
+    ));
+    f.assert_rejected_deposit(&existing_id, 0, &f.config);
+
+    // Compare the full record in its Soroban representation.
+    let before: Val = before.into_val(&f.env);
+    let after: Val = escrow.get_escrow(&existing_id).into_val(&f.env);
+    assert_eq!(
+        soroban_sdk::vec![&f.env, before],
+        soroban_sdk::vec![&f.env, after]
+    );
+}
 
 // ── Existing baseline tests ─────────────────────────────────────────────────
 
