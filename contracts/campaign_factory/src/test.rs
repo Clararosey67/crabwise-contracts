@@ -1,5 +1,8 @@
 #![cfg(test)]
 
+use soroban_sdk::{testutils::Address as _, Address, Bytes, Env, Symbol};
+
+use crate::{CampaignFactory, CampaignFactoryClient, CampaignFactoryError, MAX_PARAMS_LEN};
 use soroban_sdk::{
     testutils::{Address as _, Events as _, MockAuth, MockAuthInvoke},
     Address, Bytes, Env, IntoVal, Symbol, TryFromVal, Vec,
@@ -87,6 +90,52 @@ fn initialize_rejects_second_init() {
     assert!(result.is_err());
 }
 
+#[test]
+fn deploy_campaign_rejects_a_duplicate_deployment_key() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let factory_id = env.register_contract(None, CampaignFactory);
+    let client = CampaignFactoryClient::new(&env, &factory_id);
+    client.initialize(&Address::generate(&env)).unwrap();
+    let creator = Address::generate(&env);
+    let params = Bytes::from_slice(&env, &[1, 2, 3, 4]);
+
+    let first = client.deploy_campaign(&creator, &params).unwrap();
+    let result = client.try_deploy_campaign(&creator, &params);
+    assert_eq!(result, Err(Ok(CampaignFactoryError::DuplicateCampaign)));
+
+    let all = client.get_all_campaigns();
+    assert_eq!(all.len(), 1);
+    assert_eq!(all.get(0).unwrap(), first);
+}
+
+#[test]
+fn deploy_campaign_rejects_invalid_configuration_without_registration() {
+    let env = Env::default();
+    env.mock_all_auths();
+
+    let factory_id = env.register_contract(None, CampaignFactory);
+    let client = CampaignFactoryClient::new(&env, &factory_id);
+    client.initialize(&Address::generate(&env)).unwrap();
+    let creator = Address::generate(&env);
+    let events_before = env.events().all().len();
+
+    let empty = Bytes::from_slice(&env, &[]);
+    assert_eq!(
+        client.try_deploy_campaign(&creator, &empty),
+        Err(Ok(CampaignFactoryError::InvalidConfiguration))
+    );
+    let too_long = Bytes::from_slice(&env, &[0u8; (MAX_PARAMS_LEN + 1) as usize]);
+    assert_eq!(
+        client.try_deploy_campaign(&creator, &too_long),
+        Err(Ok(CampaignFactoryError::InvalidConfiguration))
+    );
+
+    assert!(client.get_all_campaigns().is_empty());
+    assert_eq!(env.events().all().len(), events_before);
+}
+
 /// A factory with `a_count` campaigns from `a` and `b_count` from `b`.
 fn factory_with_campaigns(
     env: &Env,
@@ -101,12 +150,13 @@ fn factory_with_campaigns(
 
     let a = Address::generate(env);
     let b = Address::generate(env);
-    let params = Bytes::from_slice(env, &[1, 2, 3, 4]);
 
-    for _ in 0..a_count {
+    for index in 0..a_count {
+        let params = Bytes::from_slice(env, &index.to_be_bytes());
         client.deploy_campaign(&a, &params).unwrap();
     }
-    for _ in 0..b_count {
+    for index in a_count..a_count + b_count {
+        let params = Bytes::from_slice(env, &index.to_be_bytes());
         client.deploy_campaign(&b, &params).unwrap();
     }
 
