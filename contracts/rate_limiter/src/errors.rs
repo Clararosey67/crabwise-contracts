@@ -17,7 +17,35 @@
 //! Discriminants are kept stable so that already-deployed error codes do not
 //! change meaning.
 
-use soroban_sdk::{contracterror, symbol_short, Symbol};
+use soroban_sdk::{contracterror, contracttype, symbol_short, Symbol};
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RateLimitExceeded {
+    pub limit: u32,
+    pub count: u32,
+    pub retry_at_ledger: u32,
+    pub retry_after_ledgers: u32,
+}
+
+pub fn limit_exceeded_response(
+    limit: u32,
+    count: u32,
+    first_ledger: u32,
+    window_ledgers: u32,
+    current_ledger: u32,
+) -> RateLimitExceeded {
+    let retry_at_ledger = first_ledger
+        .saturating_add(window_ledgers)
+        .saturating_add(1);
+
+    RateLimitExceeded {
+        limit,
+        count,
+        retry_at_ledger,
+        retry_after_ledgers: retry_at_ledger.saturating_sub(current_ledger),
+    }
+}
 
 #[contracterror]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
