@@ -347,4 +347,53 @@ fn test_mentorship_authorization_boundaries() {
     assert!(f.client.get_engagement(&eng_id).status == EngagementStatus::Active);
     assert!(f.client.get_milestones(&eng_id).get(0).unwrap().status == MilestoneStatus::Submitted);
     assert_eq!(f.client.get_feedback(&eng_id).len(), 0);
+fn test_completed_milestone_cannot_be_completed_twice_or_pay_twice() {
+    let f = setup();
+    let ms = default_milestones(&f.env);
+    let desc = String::from_str(&f.env, "Replay guard test");
+    let compensation: i128 = 1_500;
+
+    let token_admin = token::StellarAssetClient::new(&f.env, &f.token_id);
+    token_admin.mint(&f.contract_id, &compensation);
+    let token_client = token::Client::new(&f.env, &f.token_id);
+
+    let eng_id = f.client.propose_engagement(
+        &f.mentor,
+        &f.mentee,
+        &desc,
+        &ms,
+        &compensation,
+        &f.token_id,
+    );
+    f.client.accept_engagement(&f.mentee, &eng_id);
+
+    f.client.submit_milestone(&f.mentee, &eng_id, &0);
+    f.client.review_milestone(&f.mentor, &eng_id, &0, &true);
+    f.client.submit_milestone(&f.mentee, &eng_id, &1);
+    f.client.review_milestone(&f.mentor, &eng_id, &1, &true);
+
+    assert_eq!(token_client.balance(&f.mentor), compensation);
+    assert_eq!(token_client.balance(&f.contract_id), 0);
+
+    let eng = f.client.get_engagement(&eng_id);
+    assert!(eng.status == EngagementStatus::Completed);
+
+    let replay_review = f.client.try_review_milestone(&f.mentor, &eng_id, &1, &true);
+    assert!(replay_review.is_err());
+    let replay_submit = f.client.try_submit_milestone(&f.mentee, &eng_id, &1);
+    assert!(replay_submit.is_err());
+    let replay_first = f.client.try_review_milestone(&f.mentor, &eng_id, &0, &true);
+    assert!(replay_first.is_err());
+
+    assert!(
+        f.client
+            .get_milestones(&eng_id)
+            .get(1)
+            .unwrap()
+            .status
+            == MilestoneStatus::Approved
+    );
+    assert_eq!(f.client.get_engagement(&eng_id).completed_at, eng.completed_at);
+    assert_eq!(token_client.balance(&f.mentor), compensation);
+    assert_eq!(token_client.balance(&f.contract_id), 0);
 }

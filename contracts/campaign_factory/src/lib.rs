@@ -10,6 +10,7 @@ pub enum DataKey {
     Admin,
     Initialized,
     Campaigns,
+    Deployment(Bytes, Address),
 }
 
 #[contracttype]
@@ -25,6 +26,18 @@ pub struct CampaignDeployedEvent {
 pub enum CampaignFactoryError {
     AlreadyInitialized = 1,
     NotInitialized = 2,
+    DuplicateCampaign = 3,
+    InvalidConfiguration = 4,
+}
+
+pub const MAX_PARAMS_LEN: u32 = 1024;
+
+fn validate_params(params: &Bytes) -> Result<(), CampaignFactoryError> {
+    if params.is_empty() || params.len() > MAX_PARAMS_LEN {
+        Err(CampaignFactoryError::InvalidConfiguration)
+    } else {
+        Ok(())
+    }
 }
 
 fn read_campaigns(env: &Env) -> Vec<Address> {
@@ -32,6 +45,16 @@ fn read_campaigns(env: &Env) -> Vec<Address> {
         .instance()
         .get(&DataKey::Campaigns)
         .unwrap_or_else(|| Vec::new(env))
+}
+
+fn emit_campaign_deployed(env: &Env, creator: &Address, contract: &Address) {
+    env.events().publish(
+        (Symbol::new(env, "campaign_deployed"),),
+        CampaignDeployedEvent {
+            creator: creator.clone(),
+            contract: contract.clone(),
+        },
+    );
 }
 
 #[contract]
@@ -58,13 +81,19 @@ impl CampaignFactory {
     pub fn deploy_campaign(
         env: Env,
         creator: Address,
-        _params: Bytes,
+        params: Bytes,
     ) -> Result<Address, CampaignFactoryError> {
         if !env.storage().instance().has(&DataKey::Initialized) {
             return Err(CampaignFactoryError::NotInitialized);
         }
+        validate_params(&params)?;
 
         creator.require_auth();
+
+        let key = DataKey::Deployment(params, creator.clone());
+        if env.storage().instance().has(&key) {
+            return Err(CampaignFactoryError::DuplicateCampaign);
+        }
 
         let contract_id = env.register_contract(None, CampaignContract);
         let client = CampaignContractClient::new(&env, &contract_id);
@@ -73,14 +102,9 @@ impl CampaignFactory {
         let mut campaigns = read_campaigns(&env);
         campaigns.push_back(contract_id.clone());
         env.storage().instance().set(&DataKey::Campaigns, &campaigns);
+        env.storage().instance().set(&key, &contract_id);
 
-        env.events().publish(
-            (Symbol::new(&env, "campaign_deployed"),),
-            CampaignDeployedEvent {
-                creator: creator.clone(),
-                contract: contract_id.clone(),
-            },
-        );
+        emit_campaign_deployed(&env, &creator, &contract_id);
 
         Ok(contract_id)
     }

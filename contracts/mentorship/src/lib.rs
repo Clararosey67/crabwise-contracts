@@ -53,6 +53,8 @@ pub enum MentorshipError {
     ProgramFull = 14,
     AlreadyEnrolled = 15,
     InvalidEnrollmentLimit = 16,
+    MilestoneAlreadyCompleted = 14,
+    RewardAlreadyPaid = 15,
 }
 
 // ── Data Types ────────────────────────────────────────────────────────────────
@@ -151,6 +153,7 @@ pub enum DataKey {
     EngagementCount,
     /// Milestones for an engagement.
     Milestones(u64),
+    CompensationPaid(u64),
     /// Feedback entries count for an engagement.
     FeedbackCount(u64),
     /// Individual feedback entry.
@@ -368,6 +371,9 @@ impl MentorshipProgram {
             let ms = milestones
                 .get(milestone_index)
                 .ok_or(MentorshipError::MilestoneOutOfRange)?;
+            if ms.status == MilestoneStatus::Approved {
+ return Err(MentorshipError::MilestoneAlreadyCompleted);
+ }
             if !(ms.status == MilestoneStatus::Pending) {
  return Err(MentorshipError::InvalidMilestoneStatus);
  }
@@ -426,6 +432,9 @@ impl MentorshipProgram {
             let ms = milestones
                 .get(milestone_index)
                 .ok_or(MentorshipError::MilestoneOutOfRange)?;
+            if ms.status == MilestoneStatus::Approved {
+ return Err(MentorshipError::MilestoneAlreadyCompleted);
+ }
             if !(ms.status == MilestoneStatus::Submitted) {
  return Err(MentorshipError::InvalidMilestoneStatus);
  }
@@ -456,7 +465,12 @@ impl MentorshipProgram {
 
             // Check if all milestones are approved — auto-complete.
             if approve && milestones.iter().all(|m| m.status == MilestoneStatus::Approved) {
-                // Effects: update engagement status and persist before any external calls
+                let paid_key = DataKey::CompensationPaid(engagement_id);
+                if env.storage().persistent().has(&paid_key) {
+ return Err(MentorshipError::RewardAlreadyPaid);
+ }
+                env.storage().persistent().set(&paid_key, &true);
+
                 engagement.status = EngagementStatus::Completed;
                 engagement.completed_at = env.ledger().sequence();
                 env.storage()

@@ -4,6 +4,7 @@
 extern crate std;
 
 use soroban_sdk::{contract, contractimpl, contracttype, token, Address, Env, Symbol, Vec};
+use shared::types::CampaignStatus;
 
 #[contracttype]
 #[derive(Clone)]
@@ -14,6 +15,11 @@ pub enum DataKey {
     EndTime,
     AcceptedAssets,
     Raised,
+    ParentCampaign,
+    Status,
+    PaidOut,
+    Refunded,
+    Contribution(Address),
 }
 
 #[contracttype]
@@ -22,6 +28,38 @@ pub struct DonationReceivedEvent {
     pub donor: Address,
     pub token: Address,
     pub amount: i128,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct PayoutEvent {
+    pub recipient: Address,
+    pub token: Address,
+    pub amount: i128,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct RefundEvent {
+    pub donor: Address,
+    pub token: Address,
+    pub amount: i128,
+}
+
+fn is_terminal(status: CampaignStatus) -> bool {
+    matches!(
+        status,
+        CampaignStatus::Completed | CampaignStatus::Cancelled | CampaignStatus::Rejected
+    )
+}
+
+fn require_active(env: &Env) {
+    let status: CampaignStatus = env
+        .storage()
+        .instance()
+        .get(&DataKey::Status)
+        .unwrap_or(CampaignStatus::Active);
+    assert!(!is_terminal(status), "campaign is closed");
 }
 
 #[contract]
@@ -61,6 +99,9 @@ impl CampaignInstanceContract {
             .instance()
             .set(&DataKey::AcceptedAssets, &accepted_assets);
         env.storage().instance().set(&DataKey::Raised, &0_i128);
+        env.storage().instance().set(&DataKey::Status, &CampaignStatus::Active);
+        env.storage().instance().set(&DataKey::PaidOut, &0_i128);
+        env.storage().instance().set(&DataKey::Refunded, &0_i128);
         env.storage().instance().set(&DataKey::Initialized, &true);
         shared::version::seed(&env, env!("CARGO_PKG_VERSION"));
     }
@@ -96,10 +137,122 @@ impl CampaignInstanceContract {
         env.storage().instance().get(&DataKey::Raised).unwrap_or(0)
     }
 
+    pub fn get_status(env: Env) -> CampaignStatus {
+        env.storage()
+            .instance()
+            .get(&DataKey::Status)
+            .unwrap_or(CampaignStatus::Active)
+    }
+
+    pub fn get_paid_out(env: Env) -> i128 {
+        env.storage().instance().get(&DataKey::PaidOut).unwrap_or(0)
+    }
+
+    pub fn get_refunded(env: Env) -> i128 {
+        env.storage().instance().get(&DataKey::Refunded).unwrap_or(0)
+    }
+
+    pub fn get_contribution(env: Env, donor: Address) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::Contribution(donor))
+            .unwrap_or(0)
+    }
+
+    pub fn get_accounting(env: Env) -> (i128, i128, i128) {
+        (
+            Self::get_raised(env.clone()),
+            Self::get_paid_out(env.clone()),
+            Self::get_refunded(env),
+        )
+    }
+
+    pub fn set_parent_campaign(env: Env, admin: Address, parent: Address) {
+        admin.require_auth();
+        assert!(Self::get_admin(env.clone()) == admin, "unauthorized");
+        env.storage().instance().set(&DataKey::ParentCampaign, &parent);
+    }
+
+    pub fn set_status(env: Env, caller: Address, status: CampaignStatus) {
+        caller.require_auth();
+        let admin = Self::get_admin(env.clone());
+        let parent: Option<Address> = env.storage().instance().get(&DataKey::ParentCampaign);
+        assert!(caller == admin || parent == Some(caller.clone()), "unauthorized");
+        assert!(is_terminal(status), "status must be terminal");
+        assert!(
+            !is_terminal(Self::get_status(env.clone())),
+            "campaign already closed"
+        );
+        env.storage().instance().set(&DataKey::Status, &status);
+        env.events()
+            .publish((Symbol::new(&env, "campaign_closed"),), status);
+    }
+
+    pub fn payout(env: Env, admin: Address, token: Address, recipient: Address, amount: i128) {
+        admin.require_auth();
+        assert!(Self::get_admin(env.clone()) == admin, "unauthorized");
+        require_active(&env);
+        assert!(amount > 0, "amount must be positive");
+        assert!(
+            Self::get_accepted_assets(env.clone()).contains(&token),
+            "token not in accepted assets"
+        );
+        let paid_out: i128 = env.storage().instance().get(&DataKey::PaidOut).unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::PaidOut, &(paid_out + amount));
+        token::Client::new(&env, &token).transfer(
+            &env.current_contract_address(),
+            &recipient,
+            &amount,
+        );
+        env.events().publish(
+            (Symbol::new(&env, "payout"),),
+            PayoutEvent {
+                recipient,
+                token,
+                amount,
+            },
+        );
+    }
+
+    pub fn refund(env: Env, admin: Address, token: Address, donor: Address, amount: i128) {
+        admin.require_auth();
+        assert!(Self::get_admin(env.clone()) == admin, "unauthorized");
+        require_active(&env);
+        assert!(amount > 0, "amount must be positive");
+        assert!(
+            Self::get_accepted_assets(env.clone()).contains(&token),
+            "token not in accepted assets"
+        );
+        let key = DataKey::Contribution(donor.clone());
+        let contributed: i128 = env.storage().instance().get(&key).unwrap_or(0);
+        assert!(contributed >= amount, "refund exceeds contributions");
+        env.storage().instance().set(&key, &(contributed - amount));
+        let refunded: i128 = env.storage().instance().get(&DataKey::Refunded).unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&DataKey::Refunded, &(refunded + amount));
+        token::Client::new(&env, &token).transfer(
+            &env.current_contract_address(),
+            &donor,
+            &amount,
+        );
+        env.events().publish(
+            (Symbol::new(&env, "refund"),),
+            RefundEvent {
+                donor,
+                token,
+                amount,
+            },
+        );
+    }
+
     /// Donate `amount` of `token` to this campaign. The token must be one of
     /// the campaign's accepted assets and the campaign must not have ended.
     pub fn donate(env: Env, donor: Address, token: Address, amount: i128) {
         donor.require_auth();
+        require_active(&env);
         if amount <= 0 {
             panic!("amount must be positive");
         }
@@ -126,6 +279,9 @@ impl CampaignInstanceContract {
         );
         let raised: i128 = env.storage().instance().get(&DataKey::Raised).unwrap_or(0);
         env.storage().instance().set(&DataKey::Raised, &(raised + amount));
+        let key = DataKey::Contribution(donor.clone());
+        let contributed: i128 = env.storage().instance().get(&key).unwrap_or(0);
+        env.storage().instance().set(&key, &(contributed + amount));
         env.events().publish(
             (Symbol::new(&env, "donation_received"),),
             DonationReceivedEvent { donor, token, amount },
@@ -343,6 +499,71 @@ mod test {
         );
 
         client.donate(&donor, &token_id, &0_i128);
+    }
+
+    #[test]
+    fn set_status_blocks_all_instance_mutations_after_closure() {
+        let env = setup_env();
+        let token_admin = Address::generate(&env);
+        let donor = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let parent = Address::generate(&env);
+        let token_id = deploy_mock_token(&env, &token_admin);
+        let contract_id = env.register_contract(None, CampaignInstanceContract);
+        let client = CampaignInstanceContractClient::new(&env, &contract_id);
+        client.initialize(
+            &admin,
+            &5_000_i128,
+            &(NOW + 86_400),
+            &Vec::from_array(&env, [token_id.clone()]),
+        );
+
+        client.set_parent_campaign(&admin, &parent);
+        MockTokenClient::new(&env, &token_id).mint(&donor, &1_000_i128);
+        client.donate(&donor, &token_id, &200_i128);
+        assert!(client.try_donate(&donor, &token_id, &100_i128).is_ok());
+
+        client.set_status(&parent, &CampaignStatus::Completed);
+        assert_eq!(client.get_status(), CampaignStatus::Completed);
+        assert!(client.try_donate(&donor, &token_id, &100_i128).is_err());
+        assert!(client.try_payout(&admin, &token_id, &admin, &50_i128).is_err());
+        assert!(client.try_refund(&admin, &token_id, &donor, &50_i128).is_err());
+    }
+
+    #[test]
+    fn accounting_reconciles_donations_refunds_and_payouts() {
+        let env = setup_env();
+        let token_admin = Address::generate(&env);
+        let donor = Address::generate(&env);
+        let recipient = Address::generate(&env);
+        let admin = Address::generate(&env);
+        let token_id = deploy_mock_token(&env, &token_admin);
+        let contract_id = env.register_contract(None, CampaignInstanceContract);
+        let client = CampaignInstanceContractClient::new(&env, &contract_id);
+        client.initialize(
+            &admin,
+            &5_000_i128,
+            &(NOW + 86_400),
+            &Vec::from_array(&env, [token_id.clone()]),
+        );
+
+        let token_client = MockTokenClient::new(&env, &token_id);
+        token_client.mint(&donor, &1_000_i128);
+        client.donate(&donor, &token_id, &600_i128);
+        client.donate(&donor, &token_id, &200_i128);
+        assert_eq!(client.get_contribution(&donor), 800);
+
+        client.refund(&admin, &token_id, &donor, &150_i128);
+        client.payout(&admin, &token_id, &recipient, &400_i128);
+
+        let (raised, paid_out, refunded) = client.get_accounting();
+        assert_eq!((raised, paid_out, refunded), (800, 400, 150));
+        assert_eq!(
+            raised,
+            paid_out + refunded + token_client.balance(&contract_id)
+        );
+        assert_eq!(token_client.balance(&donor), 350);
+        assert_eq!(token_client.balance(&recipient), 400);
     }
 
     #[contracttype]
