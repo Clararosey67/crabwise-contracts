@@ -533,6 +533,9 @@ impl CampaignContract {
             .get::<DataKey, Campaign>(&DataKey::Campaign(campaign_id))
             .unwrap();
         crate::require!(env, campaign_open, campaign.status);
+        if env.ledger().timestamp() > campaign.deadline {
+            crate::errors::raise(&env, crate::errors::Error::CampaignEnded);
+        }
         // Checked addition: a silent wrap of `raised` would report a balance
         // the campaign does not hold (#760).
         campaign.raised = math::add(&env, campaign.raised, amount);
@@ -567,6 +570,10 @@ impl CampaignContract {
         }
 
         let mut campaign = Self::get_campaign(env.clone(), campaign_id).expect("campaign not found");
+        crate::require!(env, campaign_open, campaign.status);
+        if env.ledger().timestamp() > campaign.deadline {
+            crate::errors::raise(&env, crate::errors::Error::CampaignEnded);
+        }
         let raised_total = campaign
             .raised
             .checked_add(amount)
