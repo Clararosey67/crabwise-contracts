@@ -10,3 +10,4 @@ escrow = { path = "../../contracts/escrow", features = ["testutils"], version = 
 platform_config = { path = "../../contracts/platform_config", features = ["testutils"], version = "0.1.0" }
 shared = { path = "../../contracts/shared", version = "0.1.0" }
 campaign_factory = { path = "../../contracts/factory", features = ["testutils"] }
+dao = { path = "../../contracts/dao", features = ["testutils"], version = "0.1.0" }
