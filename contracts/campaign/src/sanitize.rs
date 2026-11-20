@@ -33,7 +33,8 @@
 // would otherwise report the ones no entry point references yet.
 #![allow(dead_code)]
 
-use soroban_sdk::{BytesN, Env, String};
+use crate::errors::Error;
+use soroban_sdk::{panic_with_error, BytesN, Env, String};
 
 pub use shared::validation::{
     MAX_DESCRIPTION_LEN, MAX_ID_LEN, MAX_MEMO_LEN, MAX_TITLE_LEN,
@@ -54,9 +55,9 @@ pub const EMPTY_HASH: &str = "InvalidAssets: reason hash must not be the zero ha
 ///
 /// Note the length check is on **bytes**, not characters: a multi-byte
 /// character can be several bytes, and the on-chain limit is a byte budget.
-pub fn require_asset_code(_env: &Env, asset_code: &String) -> String {
-    if asset_code.is_empty() || asset_code.len() > MAX_ASSET_CODE_LEN {
-        panic!("{}", INVALID_ASSETS);
+pub fn require_asset_code(env: &Env, asset_code: &String) -> String {
+    if !is_valid_asset_code(asset_code) {
+        panic_with_error!(env, Error::InvalidAssets);
     }
     asset_code.clone()
 }
@@ -66,7 +67,7 @@ pub fn require_asset_code(_env: &Env, asset_code: &String) -> String {
 /// "reason provided" check without providing a reason.
 pub fn require_reason_hash(env: &Env, reason_hash: &BytesN<32>) -> BytesN<32> {
     if *reason_hash == BytesN::from_array(env, &[0u8; 32]) {
-        panic!("{}", EMPTY_HASH);
+        panic_with_error!(env, Error::InvalidAssets);
     }
     reason_hash.clone()
 }
@@ -75,8 +76,31 @@ pub fn require_reason_hash(env: &Env, reason_hash: &BytesN<32>) -> BytesN<32> {
 /// to stay readable on chain (a memo, a resolution note); prefer
 /// [`require_reason_hash`] wherever the text can live off chain.
 pub fn require_bounded(_env: &Env, value: &String, max_len: u32, field: &str) -> String {
-    if value.len() > max_len {
-        panic!("{} exceeds maximum length of {} bytes", field, max_len);
+    if !is_valid_bounded(value, max_len) {
+        panic!("{} must be non-empty and at most {} bytes", field, max_len);
+    }
+    value.clone()
+}
+
+pub fn is_valid_bounded(value: &String, max_len: u32) -> bool {
+    !value.is_empty() && value.len() <= max_len
+}
+
+pub fn is_valid_identifier(value: &String) -> bool {
+    if !is_valid_bounded(value, MAX_ID_LEN) {
+        return false;
+    }
+    let len = value.len() as usize;
+    let mut bytes = [0u8; MAX_ID_LEN as usize];
+    value.copy_into_slice(&mut bytes[..len]);
+    bytes[..len]
+        .iter()
+        .all(|b| b.is_ascii_alphanumeric() || *b == b'-' || *b == b'_')
+}
+
+pub fn require_identifier(env: &Env, value: &String) -> String {
+    if !is_valid_identifier(value) {
+        panic_with_error!(env, Error::InvalidAssets);
     }
     value.clone()
 }
@@ -84,7 +108,7 @@ pub fn require_bounded(_env: &Env, value: &String, max_len: u32, field: &str) ->
 /// True when `asset_code` would be accepted. Read-only counterpart of
 /// [`require_asset_code`], for callers that want to branch instead of abort.
 pub fn is_valid_asset_code(asset_code: &String) -> bool {
-    !asset_code.is_empty() && asset_code.len() <= MAX_ASSET_CODE_LEN
+    is_valid_bounded(asset_code, MAX_ASSET_CODE_LEN)
 }
 
 #[cfg(test)]

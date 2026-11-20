@@ -13,8 +13,13 @@ use licensing::{LicensingMarketplace, LicensingMarketplaceClient, LicenseStatus,
 use platform_config::types::AddressEnvironment;
 use soroban_sdk::{symbol_short, Bytes, BytesN, String};
 use campaign_factory::{CampaignFactoryContract, CampaignFactoryContractClient};
+use campaign_instance::{CampaignInstanceContract, CampaignInstanceContractClient};
+use ecosystem_funding::{
+    EcosystemFunding, EcosystemFundingClient, ProgramMilestoneStatus, ProgramType,
+};
+use shared::types::CampaignStatus;
 use soroban_sdk::testutils::Events as _;
-use soroban_sdk::TryFromVal;
+use soroban_sdk::{token, String, TryFromVal};
 
 const AMOUNT: i128 = 10_000;
 const FEE_BPS: u32 = 500;
@@ -420,4 +425,110 @@ fn licensing_changes_are_restricted_to_the_record_owner() {
 
     client.revoke_license(&owner, &license_id);
     assert!(client.get_license(&license_id).status == LicenseStatus::Revoked);
+fn campaign_instance_mutations_are_blocked_after_parent_closure() {
+    let env = Environment::new();
+    let admin = env.address();
+    let parent = env.address();
+    let donor = env.address();
+
+    let contract_id = env.env.register_contract(None, CampaignInstanceContract);
+    let instance = CampaignInstanceContractClient::new(&env.env, &contract_id);
+    let end_time = env.env.ledger().timestamp() + 86_400;
+    instance.initialize(
+        &admin,
+        &5_000_i128,
+        &end_time,
+        &soroban_sdk::vec![&env.env, env.usdc.clone()],
+    );
+    instance.set_parent_campaign(&admin, &parent);
+
+    env.mint(&donor, 1_000);
+    instance.donate(&donor, &env.usdc, &200);
+    assert_eq!(instance.get_raised(), 200);
+
+    instance.set_status(&parent, &CampaignStatus::Completed);
+    assert_eq!(instance.get_status(), CampaignStatus::Completed);
+    assert!(instance.try_donate(&donor, &env.usdc, &100).is_err());
+    assert!(instance.try_payout(&admin, &env.usdc, &admin, &50).is_err());
+    assert!(instance.try_refund(&admin, &env.usdc, &donor, &50).is_err());
+    assert_eq!(instance.get_raised(), 200);
+}
+
+#[test]
+fn campaign_instance_accounting_conserves_funds_end_to_end() {
+    let env = Environment::new();
+    let admin = env.address();
+    let donor = env.address();
+    let recipient = env.address();
+
+    let contract_id = env.env.register_contract(None, CampaignInstanceContract);
+    let instance = CampaignInstanceContractClient::new(&env.env, &contract_id);
+    let end_time = env.env.ledger().timestamp() + 86_400;
+    instance.initialize(
+        &admin,
+        &5_000_i128,
+        &end_time,
+        &soroban_sdk::vec![&env.env, env.usdc.clone()],
+    );
+
+    env.mint(&donor, 1_000);
+    instance.donate(&donor, &env.usdc, &600);
+    instance.donate(&donor, &env.usdc, &200);
+    instance.refund(&admin, &env.usdc, &donor, &150);
+    instance.payout(&admin, &env.usdc, &recipient, &400);
+
+    let (raised, paid_out, refunded) = instance.get_accounting();
+    assert_eq!((raised, paid_out, refunded), (800, 400, 150));
+    assert_eq!(raised, paid_out + refunded + env.balance(&contract_id));
+    assert_eq!(env.balance(&donor), 350);
+    assert_eq!(env.balance(&recipient), 400);
+}
+
+#[test]
+fn ecosystem_grant_milestones_require_ordered_approval() {
+    let env = Environment::new();
+    let manager = env.address();
+    let recipient = env.address();
+
+    let contract_id = env.env.register_contract(None, EcosystemFunding);
+    let grants = EcosystemFundingClient::new(&env.env, &contract_id);
+    grants.initialize(&env.address());
+
+    let milestones = soroban_sdk::vec![
+        &env.env,
+        (
+            String::from_str(&env.env, "m0"),
+            String::from_str(&env.env, "d0"),
+            100_i128
+        ),
+        (
+            String::from_str(&env.env, "m1"),
+            String::from_str(&env.env, "d1"),
+            200_i128
+        ),
+    ];
+    let program_id = grants.create_program(
+        &manager,
+        &recipient,
+        &String::from_str(&env.env, "grant"),
+        &String::from_str(&env.env, "description"),
+        &ProgramType::Grant,
+        &milestones,
+        &env.usdc,
+    );
+    token::StellarAssetClient::new(&env.env, &env.usdc).mint(&contract_id, &300_i128);
+    let uri = String::from_str(&env.env, "uri");
+
+    grants.submit_milestone(&recipient, &program_id, &1, &uri);
+    assert!(grants
+        .try_review_milestone(&manager, &program_id, &1, &true)
+        .is_err());
+
+    grants.submit_milestone(&recipient, &program_id, &0, &uri);
+    grants.review_milestone(&manager, &program_id, &0, &true);
+    grants.review_milestone(&manager, &program_id, &1, &true);
+
+    let milestones = grants.get_milestones(&program_id);
+    assert!(milestones.get(0).unwrap().status == ProgramMilestoneStatus::Approved);
+    assert!(milestones.get(1).unwrap().status == ProgramMilestoneStatus::Approved);
 }

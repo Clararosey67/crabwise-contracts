@@ -13,12 +13,43 @@ use crate::errors::{get_suggestion, Error};
 use crate::guard;
 use crate::math;
 use crate::require;
+use crate::sanitize;
 use shared::types::CampaignStatus;
-use soroban_sdk::Env;
+use soroban_sdk::{contract, contractimpl, contracttype, BytesN, Env, String};
 use std::vec::Vec;
 
 /// Maximum end-time horizon, mirroring `MAX_DEADLINE_OFFSET_SECS`.
 const TWO_YEARS: u64 = 63_115_200;
+
+#[contracttype]
+#[derive(Clone)]
+pub enum ContributionKey {
+    Total,
+}
+
+#[contract]
+pub struct ContributionLedger;
+
+#[contractimpl]
+impl ContributionLedger {
+    pub fn record(env: Env, amount: i128) -> Result<i128, Error> {
+        let total: i128 = env
+            .storage()
+            .instance()
+            .get(&ContributionKey::Total)
+            .unwrap_or(0);
+        let next = math::checked_add_contribution(total, amount)?;
+        env.storage().instance().set(&ContributionKey::Total, &next);
+        Ok(next)
+    }
+
+    pub fn total(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&ContributionKey::Total)
+            .unwrap_or(0)
+    }
+}
 
 // ── Lifecycle ──────────────────────────────────────────────────────────────────
 
@@ -149,6 +180,83 @@ fn test_asset_code_fails_when_empty_or_over_length() {
 }
 
 #[test]
+fn test_sanitize_bounded_text_accepts_boundaries_and_rejects_empty() {
+    let env = Env::default();
+    let one = String::from_str(&env, "A");
+    assert!(sanitize::is_valid_bounded(&one, 1));
+    assert_eq!(sanitize::require_bounded(&env, &one, 1, "memo"), one);
+
+    let empty = String::from_str(&env, "");
+    assert!(!sanitize::is_valid_bounded(&empty, 1));
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            sanitize::require_bounded(&env, &empty, 1, "memo")
+        }))
+        .is_err()
+    );
+
+    let over = String::from_str(&env, "AB");
+    assert!(!sanitize::is_valid_bounded(&over, 1));
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            sanitize::require_bounded(&env, &over, 1, "memo")
+        }))
+        .is_err()
+    );
+}
+
+#[test]
+fn test_sanitize_identifier_accepts_boundary_and_rejects_invalid() {
+    let env = Env::default();
+    let boundary = std::iter::repeat('A')
+        .take(sanitize::MAX_ID_LEN as usize)
+        .collect::<std::string::String>();
+    let identifier = String::from_str(&env, &boundary);
+    assert_eq!(identifier.len(), sanitize::MAX_ID_LEN);
+    assert!(sanitize::is_valid_identifier(&identifier));
+    assert_eq!(sanitize::require_identifier(&env, &identifier), identifier);
+
+    let empty = String::from_str(&env, "");
+    assert!(!sanitize::is_valid_identifier(&empty));
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            sanitize::require_identifier(&env, &empty)
+        }))
+        .is_err()
+    );
+
+    let too_long = String::from_str(&env, &(boundary.clone() + "A"));
+    assert!(!sanitize::is_valid_identifier(&too_long));
+    let invalid = String::from_str(&env, "bad id!");
+    assert!(!sanitize::is_valid_identifier(&invalid));
+}
+
+#[test]
+fn test_sanitize_asset_code_and_hash_boundaries_are_consistent() {
+    let env = Env::default();
+    let max = String::from_str(&env, "ABCDEFGHIJKL");
+    assert!(sanitize::is_valid_asset_code(&max));
+    assert_eq!(sanitize::require_asset_code(&env, &max), max);
+
+    let empty = String::from_str(&env, "");
+    let over = String::from_str(&env, "ABCDEFGHIJKLM");
+    assert!(!sanitize::is_valid_asset_code(&empty));
+    assert!(!sanitize::is_valid_asset_code(&over));
+
+    let zero = BytesN::from_array(&env, &[0u8; 32]);
+    assert!(
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            sanitize::require_reason_hash(&env, &zero)
+        }))
+        .is_err()
+    );
+    let mut bytes = [0u8; 32];
+    bytes[31] = 1;
+    let valid = BytesN::from_array(&env, &bytes);
+    assert_eq!(sanitize::require_reason_hash(&env, &valid), valid);
+}
+
+#[test]
 fn test_donate_fails_below_minimum_amount() {
     assert_eq!(require::check_donation_minimum(0, 1), Err(Error::DonationTooSmall));
     assert_eq!(
@@ -221,6 +329,31 @@ fn test_withdrawal_action_fails_without_a_pending_request() {
 }
 
 // ── Arithmetic ─────────────────────────────────────────────────────────────────
+
+#[test]
+fn test_contribution_total_accepts_the_representable_boundary() {
+    assert_eq!(
+        math::checked_add_contribution(i128::MAX - 1, 1),
+        Ok(i128::MAX)
+    );
+    assert_eq!(
+        math::checked_add_contribution(1, i128::MAX - 1),
+        Ok(i128::MAX)
+    );
+    assert_eq!(math::checked_add_contribution(0, i128::MAX), Ok(i128::MAX));
+    assert_eq!(math::checked_add_contribution(0, 0), Ok(0));
+}
+
+#[test]
+fn test_contribution_total_overflow_leaves_state_unchanged() {
+    let env = Env::default();
+    let contract_id = env.register_contract(None, ContributionLedger);
+    let client = ContributionLedgerClient::new(&env, &contract_id);
+
+    assert_eq!(client.record(&i128::MAX), Ok(i128::MAX));
+    assert_eq!(client.try_record(&1), Err(Ok(Error::Overflow)));
+    assert_eq!(client.total(), i128::MAX);
+}
 
 #[test]
 fn test_accumulating_totals_fails_on_overflow() {
