@@ -338,6 +338,13 @@ impl EcosystemFunding {
         );
 
         if approve {
+            assert!(
+                milestones
+                    .iter()
+                    .take(milestone_index as usize)
+                    .all(|m| m.status == ProgramMilestoneStatus::Approved),
+                "previous milestone must be approved first"
+            );
             // Disburse funds.
             let tok = token::Client::new(&env, &program.token);
             tok.transfer(
@@ -767,5 +774,88 @@ mod pagination_tests {
         let (page, info) = client.get_outcomes_page(&program_id, &u64::MAX, &u64::MAX);
         assert!(page.is_empty());
         assert!(!info.has_more);
+    }
+}
+
+#[cfg(test)]
+mod milestone_order_tests {
+    extern crate std;
+
+    use super::*;
+    use soroban_sdk::testutils::Address as _;
+
+    fn setup(env: &Env) -> (EcosystemFundingClient, u64, Address, Address) {
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, EcosystemFunding);
+        let client = EcosystemFundingClient::new(env, &contract_id);
+        client.initialize(&Address::generate(env));
+
+        let manager = Address::generate(env);
+        let recipient = Address::generate(env);
+        let milestones = soroban_sdk::vec![
+            env,
+            (
+                String::from_str(env, "m0"),
+                String::from_str(env, "d0"),
+                100_i128
+            ),
+            (
+                String::from_str(env, "m1"),
+                String::from_str(env, "d1"),
+                200_i128
+            ),
+            (
+                String::from_str(env, "m2"),
+                String::from_str(env, "d2"),
+                300_i128
+            ),
+        ];
+        let asset = env
+            .register_stellar_asset_contract_v2(Address::generate(env))
+            .address();
+        let program_id = client.create_program(
+            &manager,
+            &recipient,
+            &String::from_str(env, "program"),
+            &String::from_str(env, "description"),
+            &ProgramType::Grant,
+            &milestones,
+            &asset,
+        );
+        token::StellarAssetClient::new(env, &asset).mint(&contract_id, &600_i128);
+
+        (client, program_id, manager, recipient)
+    }
+
+    #[test]
+    fn review_milestone_rejects_approval_before_earlier_milestone() {
+        let env = Env::default();
+        let (client, program_id, manager, recipient) = setup(&env);
+        let uri = String::from_str(&env, "uri");
+
+        client.submit_milestone(&recipient, &program_id, &1, &uri);
+        assert!(client
+            .try_review_milestone(&manager, &program_id, &1, &true)
+            .is_err());
+        let milestones = client.get_milestones(&program_id);
+        assert!(milestones.get(1).unwrap().status == ProgramMilestoneStatus::Submitted);
+    }
+
+    #[test]
+    fn review_milestone_allows_in_order_approvals() {
+        let env = Env::default();
+        let (client, program_id, manager, recipient) = setup(&env);
+        let uri = String::from_str(&env, "uri");
+
+        for i in 0..3u32 {
+            client.submit_milestone(&recipient, &program_id, &i, &uri);
+            client.review_milestone(&manager, &program_id, &i, &true);
+        }
+
+        let milestones = client.get_milestones(&program_id);
+        assert!(milestones
+            .iter()
+            .all(|m| m.status == ProgramMilestoneStatus::Approved));
+        assert!(client.get_program(&program_id).status == ProgramStatus::Completed);
     }
 }

@@ -1,8 +1,23 @@
 #![cfg(test)]
 
-use soroban_sdk::{testutils::Address as _, Address, Bytes, Env, Symbol};
+use soroban_sdk::{
+    testutils::{Address as _, Events as _, MockAuth, MockAuthInvoke},
+    Address, Bytes, Env, IntoVal, Symbol, TryFromVal, Vec,
+};
 
-use crate::{CampaignFactory, CampaignFactoryClient};
+use crate::{CampaignDeployedEvent, CampaignFactory, CampaignFactoryClient};
+
+fn deployed_events(env: &Env) -> Vec<CampaignDeployedEvent> {
+    let mut found = Vec::new(env);
+    for (_, topics, data) in env.events().all().iter() {
+        if let Some(topic) = topics.get(0) {
+            if Symbol::try_from_val(env, &topic).unwrap() == Symbol::new(env, "campaign_deployed") {
+                found.push_back(CampaignDeployedEvent::try_from_val(env, &data).unwrap());
+            }
+        }
+    }
+    found
+}
 
 #[test]
 fn deploy_campaign_creates_a_campaign_instance() {
@@ -23,11 +38,39 @@ fn deploy_campaign_creates_a_campaign_instance() {
     assert_eq!(all.len(), 1);
     assert_eq!(all.get(0).unwrap(), deployed);
 
-    let events = env.events().all();
+    let events = deployed_events(&env);
     assert_eq!(events.len(), 1);
-    let event = &events[0];
-    let topic = event.topics().get(0).unwrap();
-    assert_eq!(topic, Symbol::new(&env, "campaign_deployed"));
+    let event = events.get(0).unwrap();
+    assert_eq!(event.creator, creator);
+    assert_eq!(event.contract, deployed);
+}
+
+#[test]
+fn failed_deployment_emits_no_success_event() {
+    let env = Env::default();
+    let factory_id = env.register_contract(None, CampaignFactory);
+    let client = CampaignFactoryClient::new(&env, &factory_id);
+    let admin = Address::generate(&env);
+    let creator = Address::generate(&env);
+    let params = Bytes::from_slice(&env, &[1, 2, 3, 4]);
+
+    assert!(client.try_deploy_campaign(&creator, &params).is_err());
+    assert!(deployed_events(&env).is_empty());
+
+    env.mock_all_auths();
+    client.initialize(&admin).unwrap();
+
+    env.mock_auths(&[MockAuth {
+        address: &creator,
+        invoke: &MockAuthInvoke {
+            contract: &factory_id,
+            fn_name: "deploy_campaign",
+            args: (creator.clone(), params.clone()).into_val(&env),
+            sub_invokes: &[],
+        },
+    }]);
+    assert!(client.try_deploy_campaign(&creator, &params).is_err());
+    assert!(deployed_events(&env).is_empty());
 }
 
 #[test]
