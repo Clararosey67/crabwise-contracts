@@ -34,12 +34,17 @@ use soroban_sdk::{panic_with_error, Env};
 /// Denominator for basis-point arithmetic (100%).
 pub const BPS_DENOM: i128 = 10_000;
 
+#[inline]
+pub fn checked_add_contribution(total: i128, contribution: i128) -> Result<i128, Error> {
+    total.checked_add(contribution).ok_or(Error::Overflow)
+}
+
 /// `a + b`, aborting with [`Error::Overflow`] on overflow.
 #[inline]
 pub fn add(env: &Env, a: i128, b: i128) -> i128 {
-    match a.checked_add(b) {
-        Some(v) => v,
-        None => panic_with_error!(env, Error::Overflow),
+    match checked_add_contribution(a, b) {
+        Ok(v) => v,
+        Err(e) => panic_with_error!(env, e),
     }
 }
 
