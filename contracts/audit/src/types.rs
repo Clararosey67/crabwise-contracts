@@ -2,6 +2,8 @@
 
 use soroban_sdk::{contracttype, Address, Bytes, Vec};
 
+pub const MAX_REFERENCE_BYTES: u32 = 64;
+
 /// What kind of transition an [`AuditEntry`] records.
 ///
 /// A closed vocabulary rather than a caller-supplied string, for three reasons:

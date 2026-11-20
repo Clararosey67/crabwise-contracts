@@ -58,7 +58,7 @@ pub mod types;
 mod test;
 
 use errors::AuditError;
-use types::{AuditAction, AuditEntry, AuditExport, AuditPage, TxStatus};
+use types::{AuditAction, AuditEntry, AuditExport, AuditPage, TxStatus, MAX_REFERENCE_BYTES};
 
 /// Re-exported so the immutability claim can be audited from the outside: this
 /// is the complete set of storage keys, and not one of them has a remove, a
@@ -94,6 +94,9 @@ fn build_entry(
     token: &Option<Address>,
     status: TxStatus,
 ) -> Result<AuditEntry, AuditError> {
+    if reference.len() > MAX_REFERENCE_BYTES {
+        return Err(AuditError::InvalidPayload);
+    }
     if amount < 0 {
         return Err(AuditError::InvalidAmount);
     }

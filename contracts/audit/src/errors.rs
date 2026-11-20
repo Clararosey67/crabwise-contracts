@@ -25,6 +25,7 @@ pub enum AuditError {
     InvalidPageSize = 8,
     /// `from_ledger` is above `to_ledger`.
     InvalidLedgerRange = 9,
+    InvalidPayload = 10,
 }
 
 impl core::fmt::Display for AuditError {
@@ -39,6 +40,7 @@ impl core::fmt::Display for AuditError {
             Self::InvalidAction => write!(f, "action and token do not match entry kind"),
             Self::InvalidPageSize => write!(f, "page size is out of range"),
             Self::InvalidLedgerRange => write!(f, "from_ledger must not exceed to_ledger"),
+            Self::InvalidPayload => write!(f, "audit payload exceeds the allowed size"),
         }
     }
 }
@@ -54,5 +56,6 @@ pub fn get_suggestion(error: AuditError) -> Symbol {
         AuditError::InvalidAction => symbol_short!("BAD_KIND"),
         AuditError::InvalidPageSize => symbol_short!("BAD_PAGE"),
         AuditError::InvalidLedgerRange => symbol_short!("BAD_RANGE"),
+        AuditError::InvalidPayload => symbol_short!("BAD_PYLD"),
     }
 }
