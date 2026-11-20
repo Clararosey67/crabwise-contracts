@@ -108,6 +108,7 @@ pub enum DataKey {
     ProgramCount,
     /// Milestones for a program.
     Milestones(u64),
+    Disbursement(u64, u32),
     /// Performance outcome count.
     OutcomeCount(u64),
     /// Individual outcome entry.
@@ -338,16 +339,20 @@ impl EcosystemFunding {
         );
 
         if approve {
-            // Disburse funds.
-            let tok = token::Client::new(&env, &program.token);
-            tok.transfer(
-                &env.current_contract_address(),
-                &program.recipient,
-                &ms.disbursement_amount,
+            let disbursement_key = DataKey::Disbursement(program_id, milestone_index);
+            assert!(
+                !env.storage().persistent().has(&disbursement_key),
+                "milestone already disbursed"
+            );
+            assert!(
+                program
+                    .total_disbursed
+                    .checked_add(ms.disbursement_amount)
+                    .map_or(false, |total| total <= program.total_allocation),
+                "disbursement exceeds program allocation"
             );
 
-            program.total_disbursed += ms.disbursement_amount;
-
+            let amount = ms.disbursement_amount;
             milestones.set(
                 milestone_index,
                 ProgramMilestone {
@@ -356,8 +361,8 @@ impl EcosystemFunding {
                     ..ms
                 },
             );
+            program.total_disbursed += amount;
 
-            // Auto-complete when all milestones approved.
             if milestones
                 .iter()
                 .all(|m| m.status == ProgramMilestoneStatus::Approved)
@@ -367,6 +372,17 @@ impl EcosystemFunding {
                 env.events()
                     .publish((symbol_short!("complete"),), program_id);
             }
+
+            env.storage().persistent().set(&disbursement_key, &true);
+            env.storage().persistent().set(&DataKey::Milestones(program_id), &milestones);
+            env.storage().persistent().set(&DataKey::Program(program_id), &program);
+
+            let tok = token::Client::new(&env, &program.token);
+            tok.transfer(
+                &env.current_contract_address(),
+                &program.recipient,
+                &amount,
+            );
         } else {
             milestones.set(
                 milestone_index,
@@ -375,10 +391,8 @@ impl EcosystemFunding {
                     ..ms
                 },
             );
+            env.storage().persistent().set(&DataKey::Milestones(program_id), &milestones);
         }
-
-        env.storage().persistent().set(&DataKey::Milestones(program_id), &milestones);
-        env.storage().persistent().set(&DataKey::Program(program_id), &program);
 
         env.events().publish(
             (symbol_short!("ms_rev"), program_id),

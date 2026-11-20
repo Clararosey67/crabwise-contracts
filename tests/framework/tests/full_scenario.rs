@@ -4,12 +4,14 @@
 //! dependency injection (#662), correlated events (#661), the classic release
 //! path, and the atomic escrow→commission flow (#656).
 
+use ecosystem_funding::{EcosystemFunding, EcosystemFundingClient, ProgramStatus, ProgramType};
 use escrow::storage::CommissionStatus;
 use integration_framework::assertions as a;
 use integration_framework::dsl::Steps;
 use integration_framework::{deploy_commission_stub, Environment, Scenario};
+use licensing::{LicensingMarketplace, LicensingMarketplaceClient, LicenseStatus, LicenseType};
 use platform_config::types::AddressEnvironment;
-use soroban_sdk::{symbol_short, Bytes, BytesN};
+use soroban_sdk::{symbol_short, Bytes, BytesN, String};
 use campaign_factory::{CampaignFactoryContract, CampaignFactoryContractClient};
 use soroban_sdk::testutils::Events as _;
 use soroban_sdk::TryFromVal;
@@ -221,6 +223,9 @@ fn factory_registration_is_atomic_on_failed_deployment() {
     assert!(result_retry.is_err());
     assert!(factory.get_deployed_campaign(&salt).is_none());
     assert_eq!(env.env.events().all().len(), events_before);
+}
+
+#[test]
 fn rejected_config_updates_preserve_existing_state() {
     let env = Environment::new();
     let admin = env.address();
@@ -244,4 +249,175 @@ fn rejected_config_updates_preserve_existing_state() {
     // A valid update after rejection proves configuration remains usable.
     cfg.config.set_fee_bps(&250);
     assert_eq!(cfg.config.get_config().fee_bps, 250);
+}
+
+#[test]
+fn ecosystem_grant_milestone_disbursement_is_idempotent() {
+    let env = Environment::new();
+    let admin = env.address();
+    let manager = env.address();
+    let recipient = env.address();
+
+    let contract = env.deploy(EcosystemFunding);
+    let client = EcosystemFundingClient::new(&env.env, &contract);
+    client.initialize(&admin);
+
+    let milestones = soroban_sdk::vec![
+        &env.env,
+        (
+            String::from_str(&env.env, "deliverable"),
+            String::from_str(&env.env, "submit report"),
+            1_000_i128,
+        )
+    ];
+    let program_id = client.create_program(
+        &manager,
+        &recipient,
+        &String::from_str(&env.env, "grant"),
+        &String::from_str(&env.env, "grant description"),
+        &ProgramType::Grant,
+        &milestones,
+        &env.usdc,
+    );
+
+    env.mint(&contract, 1_000);
+    client.submit_milestone(
+        &recipient,
+        &program_id,
+        &0,
+        &String::from_str(&env.env, "ipfs://deliverable"),
+    );
+    client.review_milestone(&manager, &program_id, &0, &true);
+
+    assert_eq!(env.balance(&recipient), 1_000);
+    assert_eq!(env.balance(&contract), 0);
+    let program = client.get_program(&program_id);
+    assert_eq!(program.total_disbursed, 1_000);
+    assert!(program.status == ProgramStatus::Completed);
+
+    let replay = client.try_review_milestone(&manager, &program_id, &0, &true);
+    assert!(replay.is_err());
+    let resubmit = client.try_submit_milestone(
+        &recipient,
+        &program_id,
+        &0,
+        &String::from_str(&env.env, "ipfs://again"),
+    );
+    assert!(resubmit.is_err());
+
+    assert_eq!(env.balance(&recipient), 1_000);
+    assert_eq!(env.balance(&contract), 0);
+    assert_eq!(client.get_program(&program_id).total_disbursed, 1_000);
+}
+
+#[test]
+fn licensing_updates_reject_invalid_metadata_and_preserve_record() {
+    let env = Environment::new();
+    let admin = env.address();
+    let owner = env.address();
+    let licensee = env.address();
+
+    let contract = env.deploy(LicensingMarketplace);
+    let client = LicensingMarketplaceClient::new(&env.env, &contract);
+    client.initialize(&admin);
+
+    let asset_id = String::from_str(&env.env, "asset-1");
+    let license_id = client.create_license(
+        &owner,
+        &licensee,
+        &asset_id,
+        &LicenseType::Commercial,
+        &500,
+        &false,
+        &0,
+    );
+    let before = client.get_license(&license_id);
+
+    let empty = client.try_update_license(
+        &owner,
+        &license_id,
+        &String::from_str(&env.env, ""),
+        &LicenseType::Commercial,
+        &900,
+        &false,
+        &0,
+    );
+    assert!(empty.is_err());
+
+    let whitespace = client.try_update_license(
+        &owner,
+        &license_id,
+        &String::from_str(&env.env, "   "),
+        &LicenseType::Commercial,
+        &900,
+        &false,
+        &0,
+    );
+    assert!(whitespace.is_err());
+
+    let after = client.get_license(&license_id);
+    assert_eq!(after.asset_id, before.asset_id);
+    assert_eq!(after.price, before.price);
+    assert!(after.license_type == before.license_type);
+    assert_eq!(after.owner, before.owner);
+    assert_eq!(after.licensee, before.licensee);
+    assert!(after.status == before.status);
+
+    client.update_license(
+        &owner,
+        &license_id,
+        &String::from_str(&env.env, "asset-2"),
+        &LicenseType::Personal,
+        &900,
+        &true,
+        &0,
+    );
+    let updated = client.get_license(&license_id);
+    assert_eq!(updated.asset_id, String::from_str(&env.env, "asset-2"));
+    assert_eq!(updated.price, 900);
+    assert!(updated.sub_licensable);
+}
+
+#[test]
+fn licensing_changes_are_restricted_to_the_record_owner() {
+    let env = Environment::new();
+    let admin = env.address();
+    let owner = env.address();
+    let licensee = env.address();
+    let third_party = env.address();
+
+    let contract = env.deploy(LicensingMarketplace);
+    let client = LicensingMarketplaceClient::new(&env.env, &contract);
+    client.initialize(&admin);
+
+    let license_id = client.create_license(
+        &owner,
+        &licensee,
+        &String::from_str(&env.env, "asset-owned"),
+        &LicenseType::Commercial,
+        &500,
+        &false,
+        &0,
+    );
+
+    let update = client.try_update_license(
+        &third_party,
+        &license_id,
+        &String::from_str(&env.env, "asset-stolen"),
+        &LicenseType::Exclusive,
+        &1,
+        &true,
+        &0,
+    );
+    assert!(update.is_err());
+    let revoke = client.try_revoke_license(&third_party, &license_id);
+    assert!(revoke.is_err());
+
+    let record = client.get_license(&license_id);
+    assert_eq!(record.owner, owner);
+    assert_eq!(record.asset_id, String::from_str(&env.env, "asset-owned"));
+    assert!(record.status == LicenseStatus::Active);
+
+    client.revoke_license(&owner, &license_id);
+    assert!(client.get_license(&license_id).status == LicenseStatus::Revoked);
 }
