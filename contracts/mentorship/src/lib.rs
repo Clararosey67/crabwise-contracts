@@ -14,6 +14,8 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, Env, String, Vec,
 };
 
+const DEFAULT_ENROLLMENT_LIMIT: u32 = 100;
+
 /// Typed errors returned by the contract entry points.
 ///
 /// These replace the `assert!`/`expect` panics that previously guarded the
@@ -48,6 +50,9 @@ pub enum MentorshipError {
     InvalidRating = 12,
     /// A certificate has already been issued.
     CertificateAlreadyIssued = 13,
+    ProgramFull = 14,
+    AlreadyEnrolled = 15,
+    InvalidEnrollmentLimit = 16,
     MilestoneAlreadyCompleted = 14,
     RewardAlreadyPaid = 15,
 }
@@ -101,6 +106,21 @@ pub struct FeedbackEntry {
     pub ledger: u32,
 }
 
+#[contracttype]
+#[derive(Clone, PartialEq)]
+pub enum ParticipantRole {
+    Mentor,
+    Learner,
+}
+
+#[contracttype]
+#[derive(Clone)]
+pub struct Enrollment {
+    pub participant: Address,
+    pub role: ParticipantRole,
+    pub ledger: u32,
+}
+
 /// The core mentorship engagement record.
 #[contracttype]
 #[derive(Clone)]
@@ -140,6 +160,9 @@ pub enum DataKey {
     Feedback(u64, u64),
     /// Admin address.
     Admin,
+    EnrollmentLimit,
+    EnrollmentCount,
+    Enrollment(Address),
 }
 
 // ── Contract ──────────────────────────────────────────────────────────────────
@@ -160,8 +183,54 @@ impl MentorshipProgram {
         env.storage()
             .persistent()
             .set(&DataKey::EngagementCount, &0u64);
+        env.storage()
+            .persistent()
+            .set(&DataKey::EnrollmentLimit, &DEFAULT_ENROLLMENT_LIMIT);
+        env.storage()
+            .persistent()
+            .set(&DataKey::EnrollmentCount, &0u32);
         env.events()
             .publish((symbol_short!("init"),), admin);
+    }
+
+    pub fn set_enrollment_limit(env: Env, admin: Address, limit: u32) -> Result<(), MentorshipError> {
+        admin.require_auth();
+        let stored_admin: Address = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Admin)
+            .ok_or(MentorshipError::NotInitialized)?;
+        if admin != stored_admin {
+            return Err(MentorshipError::Unauthorized);
+        }
+        if limit == 0 {
+            return Err(MentorshipError::InvalidEnrollmentLimit);
+        }
+        let enrolled: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EnrollmentCount)
+            .unwrap_or(0);
+        if limit < enrolled {
+            return Err(MentorshipError::InvalidEnrollmentLimit);
+        }
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::EnrollmentLimit, &limit);
+        env.events()
+            .publish((symbol_short!("enrlimit"),), limit);
+        Ok(())
+    }
+
+    pub fn enroll_mentor(env: Env, mentor: Address) -> Result<(), MentorshipError> {
+        mentor.require_auth();
+        Self::enroll(&env, mentor, ParticipantRole::Mentor)
+    }
+
+    pub fn enroll_learner(env: Env, learner: Address) -> Result<(), MentorshipError> {
+        learner.require_auth();
+        Self::enroll(&env, learner, ParticipantRole::Learner)
     }
 
     // ── Engagement Lifecycle ──────────────────────────────────────────────
@@ -525,6 +594,26 @@ impl MentorshipProgram {
         Self::load_engagement(&env, engagement_id)
     }
 
+    pub fn get_enrollment(env: Env, participant: Address) -> Option<Enrollment> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Enrollment(participant))
+    }
+
+    pub fn get_enrollment_count(env: Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::EnrollmentCount)
+            .unwrap_or(0)
+    }
+
+    pub fn get_enrollment_limit(env: Env) -> u32 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::EnrollmentLimit)
+            .unwrap_or(0)
+    }
+
     /// Retrieve all milestones for an engagement.
     ///
     /// Unbounded: this returns the whole stored vector, and the milestone list
@@ -624,6 +713,45 @@ impl MentorshipProgram {
                     .get::<DataKey, FeedbackEntry>(&DataKey::Feedback(engagement_id, u64::from(i)))
             },
         )
+    }
+
+    fn enroll(env: &Env, participant: Address, role: ParticipantRole) -> Result<(), MentorshipError> {
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::Enrollment(participant.clone()))
+        {
+            return Err(MentorshipError::AlreadyEnrolled);
+        }
+
+        let count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EnrollmentCount)
+            .unwrap_or(0);
+        let limit: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::EnrollmentLimit)
+            .ok_or(MentorshipError::NotInitialized)?;
+        if count >= limit {
+            return Err(MentorshipError::ProgramFull);
+        }
+
+        let enrollment = Enrollment {
+            participant: participant.clone(),
+            role,
+            ledger: env.ledger().sequence(),
+        };
+        env.storage()
+            .persistent()
+            .set(&DataKey::Enrollment(participant.clone()), &enrollment);
+        env.storage()
+            .persistent()
+            .set(&DataKey::EnrollmentCount, &(count + 1));
+        env.events()
+            .publish((symbol_short!("enrolled"),), (participant, enrollment.role));
+        Ok(())
     }
 
     fn next_id(env: &Env) -> u64 {

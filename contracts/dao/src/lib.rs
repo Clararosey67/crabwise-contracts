@@ -66,6 +66,7 @@ pub struct Proposal {
     pub requires_multisig: bool,
     /// Number of multi-sig approvals collected.
     pub multisig_approvals: u32,
+    pub unique_voters: u32,
 }
 
 /// A record of a vote cast on a proposal.
@@ -262,6 +263,7 @@ impl DaoGovernance {
             executable_after: 0,
             requires_multisig,
             multisig_approvals: 0,
+            unique_voters: 0,
         };
 
         env.storage().persistent().set(&DataKey::Proposal(id), &proposal);
@@ -331,6 +333,7 @@ impl DaoGovernance {
         );
 
         let now = env.ledger().sequence();
+        assert!(now >= proposal.voting_start, "voting period has not started");
         assert!(now <= proposal.voting_end, "voting period has ended");
 
         let gov_token: Address = env
@@ -347,6 +350,7 @@ impl DaoGovernance {
         } else {
             proposal.votes_against += weight;
         }
+        proposal.unique_voters += 1;
 
         env.storage().persistent().set(&DataKey::HasVoted(proposal_id, voter.clone()), &true);
 

@@ -290,6 +290,63 @@ fn test_issue_certificate() {
 }
 
 #[test]
+fn test_enrollment_capacity_is_enforced() {
+    let f = setup();
+    f.client.set_enrollment_limit(&f._admin, &2);
+    assert_eq!(f.client.get_enrollment_limit(), 2);
+
+    let learner = Address::generate(&f.env);
+    let rejected = Address::generate(&f.env);
+
+    f.client.enroll_mentor(&f.mentor);
+    assert_eq!(f.client.get_enrollment_count(), 1);
+    let mentor_enrollment = f.client.get_enrollment(&f.mentor).unwrap();
+    assert!(mentor_enrollment.role == ParticipantRole::Mentor);
+
+    f.client.enroll_learner(&learner);
+    assert_eq!(f.client.get_enrollment_count(), 2);
+    assert!(f.client.get_enrollment(&learner).unwrap().role == ParticipantRole::Learner);
+
+    assert!(f.client.try_enroll_learner(&rejected).is_err());
+    assert!(f.client.get_enrollment(&rejected).is_none());
+    assert_eq!(f.client.get_enrollment_count(), 2);
+
+    assert!(f.client.try_enroll_mentor(&f.mentor).is_err());
+    assert!(f.client.get_enrollment(&f.mentor).unwrap().role == ParticipantRole::Mentor);
+    assert_eq!(f.client.get_enrollment_count(), 2);
+
+    assert!(f.client.try_set_enrollment_limit(&f._admin, &0).is_err());
+    assert!(f.client.try_set_enrollment_limit(&f._admin, &1).is_err());
+    assert_eq!(f.client.get_enrollment_limit(), 2);
+}
+
+#[test]
+fn test_mentorship_authorization_boundaries() {
+    let f = setup();
+    let ms = default_milestones(&f.env);
+    let desc = String::from_str(&f.env, "Authorization boundaries");
+    let outsider = Address::generate(&f.env);
+    let eng_id = f.client.propose_engagement(&f.mentor, &f.mentee, &desc, &ms, &0, &f.token_id);
+
+    assert!(f.client.try_accept_engagement(&f.mentor, &eng_id).is_err());
+    assert!(f.client.try_accept_engagement(&outsider, &eng_id).is_err());
+    f.client.accept_engagement(&f.mentee, &eng_id);
+
+    assert!(f.client.try_submit_milestone(&f.mentor, &eng_id, &0).is_err());
+    assert!(f.client.try_submit_milestone(&outsider, &eng_id, &0).is_err());
+    f.client.submit_milestone(&f.mentee, &eng_id, &0);
+
+    assert!(f.client.try_review_milestone(&f.mentee, &eng_id, &0, &true).is_err());
+    assert!(f.client.try_review_milestone(&outsider, &eng_id, &0, &true).is_err());
+
+    assert!(f.client.try_cancel_engagement(&outsider, &eng_id).is_err());
+    let comment = String::from_str(&f.env, "Unrelated feedback");
+    assert!(f.client.try_submit_feedback(&outsider, &eng_id, &5, &comment).is_err());
+    assert!(f.client.try_issue_certificate(&outsider, &eng_id).is_err());
+
+    assert!(f.client.get_engagement(&eng_id).status == EngagementStatus::Active);
+    assert!(f.client.get_milestones(&eng_id).get(0).unwrap().status == MilestoneStatus::Submitted);
+    assert_eq!(f.client.get_feedback(&eng_id).len(), 0);
 fn test_completed_milestone_cannot_be_completed_twice_or_pay_twice() {
     let f = setup();
     let ms = default_milestones(&f.env);

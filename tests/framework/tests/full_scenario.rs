@@ -11,6 +11,11 @@ use integration_framework::dsl::Steps;
 use integration_framework::{deploy_commission_stub, Environment, Scenario};
 use licensing::{LicensingMarketplace, LicensingMarketplaceClient, LicenseStatus, LicenseType};
 use platform_config::types::AddressEnvironment;
+use soroban_sdk::{symbol_short, Address, Bytes, BytesN, String, Vec};
+use campaign_factory::{CampaignFactoryContract, CampaignFactoryContractClient};
+use dao::{DaoGovernance, DaoGovernanceClient};
+use soroban_sdk::testutils::{Events as _, Ledger as _};
+use soroban_sdk::TryFromVal;
 use soroban_sdk::{symbol_short, Bytes, BytesN, String};
 use campaign_factory::{CampaignFactoryContract, CampaignFactoryContractClient};
 use campaign_instance::{CampaignInstanceContract, CampaignInstanceContractClient};
@@ -256,6 +261,114 @@ fn rejected_config_updates_preserve_existing_state() {
     assert_eq!(cfg.config.get_config().fee_bps, 250);
 }
 
+const DAO_VOTING_PERIOD: u32 = 10;
+
+struct DaoScenario {
+    env: Environment,
+    dao_id: Address,
+    voter: Address,
+    proposal_id: u64,
+}
+
+impl DaoScenario {
+    fn dao(&self) -> DaoGovernanceClient<'_> {
+        DaoGovernanceClient::new(&self.env.env, &self.dao_id)
+    }
+}
+
+fn dao_scenario() -> DaoScenario {
+    let env = Environment::new();
+    let admin = env.address();
+    let proposer = env.address();
+    let voter = env.address();
+    env.mint(&proposer, 1);
+    env.mint(&voter, 100);
+    env.env.ledger().set_sequence_number(100);
+
+    let dao_id = env.deploy(DaoGovernance);
+    let dao = DaoGovernanceClient::new(&env.env, &dao_id);
+    dao.initialize(
+        &admin,
+        &env.usdc,
+        &Vec::new(&env.env),
+        &0,
+        &0,
+        &DAO_VOTING_PERIOD,
+    );
+    dao.set_total_supply(&admin, &1_000);
+
+    let title = String::from_str(&env.env, "Governance test");
+    let description = String::from_str(&env.env, "Vote guard verification");
+    let proposal_id = dao.create_proposal(&proposer, &title, &description, &false);
+
+    DaoScenario {
+        env,
+        dao_id,
+        voter,
+        proposal_id,
+    }
+}
+
+#[test]
+fn dao_rejects_duplicate_votes_per_proposal() {
+    let f = dao_scenario();
+    let dao = f.dao();
+    let other = f.env.address();
+    f.env.mint(&other, 50);
+
+    dao.cast_vote(&f.voter, &f.proposal_id, &true);
+    let proposal = dao.get_proposal(&f.proposal_id);
+    assert_eq!(proposal.votes_for, 100);
+    assert_eq!(proposal.unique_voters, 1);
+    assert!(dao.has_voted(&f.proposal_id, &f.voter));
+    assert_eq!(dao.get_vote(&f.proposal_id, &f.voter).unwrap().weight, 100);
+
+    assert!(dao
+        .try_cast_vote(&f.voter, &f.proposal_id, &false)
+        .is_err());
+    let proposal = dao.get_proposal(&f.proposal_id);
+    assert_eq!(proposal.votes_for, 100);
+    assert_eq!(proposal.votes_against, 0);
+    assert_eq!(proposal.unique_voters, 1);
+    assert!(dao.get_vote(&f.proposal_id, &f.voter).unwrap().support);
+
+    dao.cast_vote(&other, &f.proposal_id, &false);
+    let proposal = dao.get_proposal(&f.proposal_id);
+    assert_eq!(proposal.votes_against, 50);
+    assert_eq!(proposal.unique_voters, 2);
+    assert!(dao.has_voted(&f.proposal_id, &other));
+}
+
+#[test]
+fn dao_voting_window_boundaries() {
+    let f = dao_scenario();
+    let dao = f.dao();
+    let before = f.env.address();
+    let at = f.env.address();
+    let after = f.env.address();
+    f.env.mint(&before, 10);
+    f.env.mint(&at, 20);
+    f.env.mint(&after, 30);
+
+    let closing = dao.get_proposal(&f.proposal_id).voting_end;
+
+    f.env.env.ledger().set_sequence_number(closing - 1);
+    dao.cast_vote(&before, &f.proposal_id, &true);
+
+    f.env.env.ledger().set_sequence_number(closing);
+    dao.cast_vote(&at, &f.proposal_id, &false);
+
+    f.env.env.ledger().set_sequence_number(closing + 1);
+    assert!(dao
+        .try_cast_vote(&after, &f.proposal_id, &true)
+        .is_err());
+
+    let proposal = dao.get_proposal(&f.proposal_id);
+    assert_eq!(proposal.votes_for, 10);
+    assert_eq!(proposal.votes_against, 20);
+    assert_eq!(proposal.unique_voters, 2);
+    assert!(!dao.has_voted(&f.proposal_id, &after));
+    assert!(dao.get_vote(&f.proposal_id, &after).is_none());
 #[test]
 fn ecosystem_grant_milestone_disbursement_is_idempotent() {
     let env = Environment::new();
