@@ -47,7 +47,10 @@ pub enum LicensingError {
     DisputeNotFound = 10,
     /// The dispute has already been resolved.
     AlreadyResolved = 11,
+    InvalidMetadata = 12,
 }
+
+const MAX_ASSET_ID_LEN: u32 = 128;
 
 // ── Data Types ────────────────────────────────────────────────────────────────
 
@@ -214,8 +217,12 @@ impl LicensingMarketplace {
         price: i128,
         sub_licensable: bool,
         expires_at: u32,
-    ) -> u64 {
+    ) -> Result<u64, LicensingError> {
         owner.require_auth();
+        Self::validate_asset_id(&asset_id)?;
+        if price < 0 {
+            return Err(LicensingError::InvalidMetadata);
+        }
 
         let id = Self::next_license_id(&env);
         let record = LicenseRecord {
@@ -244,7 +251,48 @@ impl LicensingMarketplace {
             (id, owner, licensee, license_type),
         );
 
-        id
+        Ok(id)
+    }
+
+    pub fn update_license(
+        env: Env,
+        caller: Address,
+        license_id: u64,
+        asset_id: String,
+        license_type: LicenseType,
+        price: i128,
+        sub_licensable: bool,
+        expires_at: u32,
+    ) -> Result<(), LicensingError> {
+        caller.require_auth();
+        let mut record: LicenseRecord = env
+            .storage()
+            .persistent()
+            .get(&DataKey::License(license_id))
+            .ok_or(LicensingError::LicenseNotFound)?;
+        if record.owner != caller {
+            return Err(LicensingError::Unauthorized);
+        }
+        Self::validate_asset_id(&asset_id)?;
+        if price < 0 {
+            return Err(LicensingError::InvalidMetadata);
+        }
+
+        record.asset_id = asset_id.clone();
+        record.license_type = license_type;
+        record.price = price;
+        record.sub_licensable = sub_licensable;
+        record.expires_at = expires_at;
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::License(license_id), &record);
+
+        env.events().publish(
+            (symbol_short!("updated"), license_id),
+            (caller, asset_id, price),
+        );
+        Ok(())
     }
 
     /// Grant a sub-license derived from an existing license.
@@ -271,6 +319,9 @@ impl LicensingMarketplace {
         price: i128,
         expires_at: u32,
     ) -> Result<u64, LicensingError> {
+        if price < 0 {
+            return Err(LicensingError::InvalidMetadata);
+        }
         let parent: LicenseRecord = env
             .storage()
             .persistent()
@@ -695,6 +746,19 @@ impl LicensingMarketplace {
                     .get::<DataKey, UsageEntry>(&DataKey::Usage(license_id, u64::from(i)))
             },
         )
+    }
+
+    fn validate_asset_id(asset_id: &String) -> Result<(), LicensingError> {
+        let len = asset_id.len();
+        if len == 0 || len > MAX_ASSET_ID_LEN {
+            return Err(LicensingError::InvalidMetadata);
+        }
+        let mut bytes = [0u8; MAX_ASSET_ID_LEN as usize];
+        asset_id.copy_into_slice(&mut bytes[..len as usize]);
+        if bytes[..len as usize].iter().all(|byte| *byte <= b' ') {
+            return Err(LicensingError::InvalidMetadata);
+        }
+        Ok(())
     }
 
     fn next_license_id(env: &Env) -> u64 {
