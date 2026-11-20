@@ -146,6 +146,9 @@ impl NftOwnership {
         }
 
         let id = Self::next_id(&env);
+        if env.storage().persistent().has(&DataKey::Nft(id)) {
+            return Err(NftError::NftExists);
+        }
 
         let nft = NftCertificate {
             id,

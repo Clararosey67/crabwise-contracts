@@ -29,6 +29,7 @@ pub enum NftError {
     RoyaltyTooHigh = 9,
     /// A negative sale price was supplied.
     NegativePrice = 10,
+    NftExists = 11,
 }
 
 impl core::fmt::Display for NftError {
@@ -44,6 +45,7 @@ impl core::fmt::Display for NftError {
             Self::Unauthorized => write!(f, "only admin can freeze"),
             Self::RoyaltyTooHigh => write!(f, "royalty_bps must not exceed 3000 (30%)"),
             Self::NegativePrice => write!(f, "price must be non-negative"),
+            Self::NftExists => write!(f, "NFT identifier already exists"),
         }
     }
 }
@@ -61,5 +63,6 @@ pub fn get_suggestion(error: NftError) -> Symbol {
         NftError::Unauthorized => symbol_short!("AUTH"),
         NftError::RoyaltyTooHigh => symbol_short!("ROY_HIGH"),
         NftError::NegativePrice => symbol_short!("NEG_PRICE"),
+        NftError::NftExists => symbol_short!("DUP_NFT"),
     }
 }
