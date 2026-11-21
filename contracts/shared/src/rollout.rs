@@ -23,28 +23,17 @@
 //! - **Counter** — `RolloutKey::FlagCount` tracks the number of distinct flags
 //!   so `RolloutState::flag_count` still works without the index vector.
 //!
-//! Write order for `set_feature_flag`:
-//!   1. Write `Flag(flag) = enabled` (the payload read by `is_feature_enabled`).
-//!   2. If `FlagPresent(flag)` is absent, write `FlagPresent(flag) = true` and
-//!      increment `FlagCount`. A reader that sees `Flag(flag)` can always find
-//!      its `FlagPresent` entry — either it was already there, or step 2 writes
-//!      it immediately after. A partial failure between steps 1 and 2 leaves a
-//!      flag whose payload exists but whose presence entry is missing; such a
-//!      flag is still readable via `is_feature_enabled` because that function
-//!      reads `Flag(flag)` directly, never the index.
-//!
-//! `disable_all_flags` (used by rollback) needs to enumerate flags. Because the
-//! index vector is gone, it now iterates via a compact stored list of flag
-//! names: `FlagList` is a `Vec<Symbol>` capped at `FLAG_LIST_CAP` entries.
-//! Rollback is an administrative emergency path; the small bounded-scan cost
-//! there is acceptable and far cheaper than paying the O(n) rewrite on every
-//! ordinary setter call.
+//! New flags are validated against both the effective feature-flag cap and
+//! the bounded rollback list before any storage is changed. Existing flags
+//! remain mutable at or above a lowered cap and do not rewrite the list.
+//! `disable_all_flags` enumerates the bounded `FlagList` during rollback.
 //!
 //! Procedures are documented in `docs/DEPLOY.md`.
 
-use crate::health;
+use crate::{health, validation};
 use soroban_sdk::{
-    contracterror, contracttype, panic_with_error, symbol_short, xdr::ToXdr, Address, Env, Symbol, Vec,
+    contracterror, contracttype, panic_with_error, symbol_short, xdr::ToXdr, Address, Env, Symbol,
+    Vec,
 };
 
 const BPS_DENOM: u32 = 10_000;
@@ -139,7 +128,6 @@ pub enum RolloutKey {
     MaxFlags,
 }
 
-
 #[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RolloutPhase {
@@ -204,26 +192,8 @@ pub fn set_flag_cap(env: &Env, cap: u32) -> Result<(), RolloutError> {
         return Err(RolloutError::InvalidFlagCap);
     }
     env.storage().instance().set(&RolloutKey::MaxFlags, &cap);
-    env.events()
-        .publish((symbol_short!("flag_cap"),), cap);
+    env.events().publish((symbol_short!("flag_cap"),), cap);
     Ok(())
-}
-
-/// Persist the flag index, refusing to grow it past [`flag_cap`] (#985).
-///
-/// This is the single enforcement point: every caller of
-/// `set_feature_flag` in the workspace goes through here, so a new contract
-/// cannot reintroduce the unbounded-index problem. The abort reverts the whole
-/// invocation, so the `Flag(...)` value written just before this is discarded
-/// too and the write is atomic.
-fn save_flag_index(env: &Env, index: &Vec<Symbol>) {
-    let cap = flag_cap(env);
-    if index.len() > cap {
-        panic_with_error!(env, RolloutError::FlagLimitReached);
-    }
-    env.storage()
-        .instance()
-        .set(&RolloutKey::FlagList, index);
 }
 
 fn flag_count(env: &Env) -> u32 {
@@ -279,12 +249,7 @@ fn phase_from_bps(bps: u32) -> RolloutPhase {
 }
 
 /// Register canary/stable contract IDs and the share of traffic sent to canary.
-pub fn set_canary_deployment(
-    env: &Env,
-    canary: Address,
-    stable: Address,
-    canary_bps: u32,
-) {
+pub fn set_canary_deployment(env: &Env, canary: Address, stable: Address, canary_bps: u32) {
     if canary_bps > BPS_DENOM {
         panic!("canary_bps exceeds 10000");
     }
@@ -331,26 +296,13 @@ pub fn route_to_canary(env: &Env, caller: &Address) -> bool {
     bucket < canary_bps
 }
 
-/// Set or update a feature flag — O(1) writes (#993).
+/// Set or update a feature flag.
 ///
-/// Only two storage writes are required on every call:
-///   1. `Flag(flag) = enabled` — the payload.
-///   2. (first-time only) `FlagPresent(flag) = true` + `FlagCount += 1`
-///      + append to `FlagList` (capped at `FLAG_LIST_CAP`).
-///
-/// Write order guarantees: a reader that observes `Flag(flag)` will always
-/// find it either already in `FlagList` (and `FlagPresent`) or will find it
-/// readable via `is_feature_enabled` even if the presence write has not
-/// landed yet, because `is_feature_enabled` reads `Flag(flag)` directly.
+/// New flags must fit both the effective cap and the rollback list before any
+/// payload, presence marker, counter, list, or event is written. Existing flags
+/// can still be toggled at capacity (including after the cap is lowered), with
+/// one payload write and no list rewrite.
 pub fn set_feature_flag(env: &Env, flag: &Symbol, enabled: bool) {
-    // Step 1 — write the payload first so a reader never sees a flag in the
-    // list that has no payload entry.
-    env.storage()
-        .instance()
-        .set(&RolloutKey::Flag(flag.clone()), &enabled);
-
-    // Step 2 — register the flag name (first time only). O(1): one presence
-    // read, one presence write, one counter read/write, one list append.
     let already_present: bool = env
         .storage()
         .instance()
@@ -358,27 +310,28 @@ pub fn set_feature_flag(env: &Env, flag: &Symbol, enabled: bool) {
         .unwrap_or(false);
 
     if !already_present {
-        // Mark as present before touching the list so a concurrent reader
-        // that observes the presence key always finds a payload entry.
+        let count = flag_count(env);
+        let mut list = flag_list(env);
+        let cap = flag_cap(env);
+        if !validation::has_capacity_for_one(count, cap)
+            || !validation::has_capacity_for_one(list.len(), cap.min(FLAG_LIST_CAP))
+        {
+            panic_with_error!(env, RolloutError::FlagLimitReached);
+        }
+
+        list.push_back(flag.clone());
+        env.storage().instance().set(&RolloutKey::FlagList, &list);
         env.storage()
             .instance()
             .set(&RolloutKey::FlagPresent(flag.clone()), &true);
-
-        let count = flag_count(env);
         env.storage()
             .instance()
             .set(&RolloutKey::FlagCount, &(count + 1));
-
-        // Append to the bounded list used by disable_all_flags. Silently skip
-        // the append once the cap is reached — the cap is generous (64) and
-        // exceeding it means the caller has an unusually large flag space.
-        let mut list = flag_list(env);
-        if list.len() < FLAG_LIST_CAP {
-            list.push_back(flag.clone());
-            save_flag_index(env, &list);
-        }
     }
 
+    env.storage()
+        .instance()
+        .set(&RolloutKey::Flag(flag.clone()), &enabled);
     env.events()
         .publish((symbol_short!("feat_flg"),), (flag.clone(), enabled));
 }
@@ -400,8 +353,7 @@ pub fn set_rollback_trigger(env: &Env, error_bps: u32) {
     env.storage()
         .instance()
         .set(&RolloutKey::RollbackErrorBps, &error_bps);
-    env.events()
-        .publish((symbol_short!("rb_trig"),), error_bps);
+    env.events().publish((symbol_short!("rb_trig"),), error_bps);
 }
 
 /// `true` when health error-rate meets the rollback trigger, or phase is already RolledBack.
@@ -430,9 +382,7 @@ fn disable_all_flags(env: &Env) {
 }
 
 fn apply_rollback(env: &Env) {
-    env.storage()
-        .instance()
-        .set(&RolloutKey::CanaryBps, &0_u32);
+    env.storage().instance().set(&RolloutKey::CanaryBps, &0_u32);
     env.storage()
         .instance()
         .set(&RolloutKey::Phase, &RolloutPhase::RolledBack);
@@ -466,7 +416,9 @@ pub fn trigger_rollback(env: &Env, admin: &Address) {
         .set(&crate::pause::PauseDataKey::Paused, &true);
     env.events().publish(
         (soroban_sdk::Symbol::new(env, "contract_paused"),),
-        crate::pause::ContractPausedEvent { admin: admin.clone() },
+        crate::pause::ContractPausedEvent {
+            admin: admin.clone(),
+        },
     );
 }
 
@@ -475,6 +427,7 @@ mod tests {
     extern crate std;
 
     use super::*;
+    use soroban_sdk::testutils::Address as _;
 
     /// A distinct symbol per index, so a cap of 32 means 32 real flags.
     fn flag(env: &Env, i: u32) -> Symbol {
@@ -582,5 +535,89 @@ mod tests {
         assert_eq!(RolloutError::FlagLimitReached as u32, 1);
         assert_eq!(RolloutError::InvalidFlagCap as u32, 2);
         assert_eq!(MAX_FEATURE_FLAGS, 32);
+    }
+
+    #[test]
+    fn rejected_flag_preserves_rollout_state_and_all_registered_flags() {
+        for cap in [1, 4, MAX_FEATURE_FLAGS] {
+            let env = Env::default();
+            let id = env.register_contract(None, crate::TestContract);
+            let (before, list_before) = env.as_contract(&id, || {
+                set_canary_deployment(
+                    &env,
+                    Address::generate(&env),
+                    Address::generate(&env),
+                    2_500,
+                );
+                set_rollback_trigger(&env, 750);
+                set_flag_cap(&env, cap).unwrap();
+                for i in 0..cap {
+                    set_feature_flag(&env, &flag(&env, i), i % 2 == 0);
+                }
+                (get_state(&env), flag_list(&env))
+            });
+
+            for enabled in [true, false] {
+                let rejected = flag(&env, cap);
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    env.as_contract(&id, || set_feature_flag(&env, &rejected, enabled));
+                }));
+                assert!(result.is_err());
+                env.as_contract(&id, || {
+                    assert_eq!(get_state(&env), before);
+                    assert_eq!(flag_list(&env), list_before);
+                    assert!(!env
+                        .storage()
+                        .instance()
+                        .has(&RolloutKey::Flag(rejected.clone())));
+                    assert!(!env
+                        .storage()
+                        .instance()
+                        .has(&RolloutKey::FlagPresent(rejected)));
+                    for i in 0..cap {
+                        assert_eq!(is_feature_enabled(&env, &flag(&env, i)), i % 2 == 0);
+                        assert_eq!(
+                            env.storage()
+                                .instance()
+                                .get::<_, bool>(&RolloutKey::FlagPresent(flag(&env, i))),
+                            Some(true)
+                        );
+                    }
+                });
+            }
+        }
+    }
+
+    #[test]
+    fn full_tracking_list_cannot_bypass_capacity_validation() {
+        let env = Env::default();
+        let id = env.register_contract(None, crate::TestContract);
+        // Exercise the old saturated-list branch, which silently skipped the
+        // append and its capacity check. Such stored data must fail closed.
+        let before = env.as_contract(&id, || {
+            let mut list = Vec::new(&env);
+            for i in 0..FLAG_LIST_CAP {
+                list.push_back(flag(&env, i));
+            }
+            env.storage().instance().set(&RolloutKey::FlagList, &list);
+            (get_state(&env), list)
+        });
+        let rejected = flag(&env, FLAG_LIST_CAP);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            env.as_contract(&id, || set_feature_flag(&env, &rejected, true));
+        }));
+        assert!(result.is_err());
+        env.as_contract(&id, || {
+            assert_eq!(get_state(&env), before.0);
+            assert_eq!(flag_list(&env), before.1);
+            assert!(!env
+                .storage()
+                .instance()
+                .has(&RolloutKey::Flag(rejected.clone())));
+            assert!(!env
+                .storage()
+                .instance()
+                .has(&RolloutKey::FlagPresent(rejected)));
+        });
     }
 }

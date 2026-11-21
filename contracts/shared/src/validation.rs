@@ -64,3 +64,28 @@ pub fn require_id_len(id: &Bytes, max_len: u32, field: &str) {
 pub fn is_id_len_valid(id: &Bytes, max_len: u32) -> bool {
     id.len() <= max_len
 }
+
+/// Whether adding one element would stay within a collection's capacity.
+///
+/// Compare before incrementing so even `u32::MAX` cannot overflow. A zero
+/// capacity, or a collection already above a lowered capacity, rejects growth.
+#[inline]
+pub fn has_capacity_for_one(current_len: u32, capacity: u32) -> bool {
+    current_len < capacity
+}
+
+#[cfg(test)]
+mod tests {
+    use super::has_capacity_for_one;
+
+    #[test]
+    fn collection_growth_respects_capacity_boundaries() {
+        assert!(has_capacity_for_one(0, 1));
+        assert!(has_capacity_for_one(31, 32));
+        assert!(!has_capacity_for_one(32, 32));
+        assert!(!has_capacity_for_one(33, 32));
+        assert!(!has_capacity_for_one(0, 0));
+        assert!(has_capacity_for_one(u32::MAX - 1, u32::MAX));
+        assert!(!has_capacity_for_one(u32::MAX, u32::MAX));
+    }
+}
