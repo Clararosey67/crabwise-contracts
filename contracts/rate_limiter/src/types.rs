@@ -4,6 +4,8 @@
 
 use soroban_sdk::Address;
 
+use crate::errors::RateLimitError;
+
 /// Different types of rate limits that can be configured
 #[derive(Clone, Debug, Eq, PartialEq, Copy)]
 #[soroban_sdk::contracttype]
@@ -24,6 +26,20 @@ pub struct RateLimitConfig {
     pub limit: u32,
     /// Duration of the rate limit window in ledgers
     pub window_ledgers: u32,
+}
+
+impl RateLimitConfig {
+    pub const fn validation_error(&self) -> Option<RateLimitError> {
+        if self.limit == 0 {
+            Some(RateLimitError::InvalidLimit)
+        } else if self.window_ledgers == 0 {
+            Some(RateLimitError::InvalidWindow)
+        } else if self.limit > self.window_ledgers {
+            Some(RateLimitError::InvalidLimit)
+        } else {
+            None
+        }
+    }
 }
 
 /// Record tracking the usage of a rate limit
