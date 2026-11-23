@@ -15,8 +15,14 @@ use crate::math;
 use crate::require;
 use crate::sanitize;
 use shared::types::CampaignStatus;
-use soroban_sdk::{contract, contractimpl, contracttype, BytesN, Env, String};
+use soroban_sdk::{
+    contract, contractimpl, contracttype, testutils::Address as _, token, Address, BytesN, Env,
+    String,
+};
 use std::vec::Vec;
+
+#[path = "asset_helpers.rs"]
+mod asset_helpers;
 
 /// Maximum end-time horizon, mirroring `MAX_DEADLINE_OFFSET_SECS`.
 const TWO_YEARS: u64 = 63_115_200;
@@ -25,6 +31,7 @@ const TWO_YEARS: u64 = 63_115_200;
 #[derive(Clone)]
 pub enum ContributionKey {
     Total,
+    AssetTotal,
 }
 
 #[contract]
@@ -47,6 +54,33 @@ impl ContributionLedger {
         env.storage()
             .instance()
             .get(&ContributionKey::Total)
+            .unwrap_or(0)
+    }
+}
+
+#[contract]
+pub struct AssetContributionLedger;
+
+#[contractimpl]
+impl AssetContributionLedger {
+    pub fn contribute(env: Env, asset: Address, from: Address, amount: i128) -> Result<(), Error> {
+        let to = env.current_contract_address();
+        asset_helpers::AssetHelper::transfer_contribution(&env, &asset, &from, &to, amount)?;
+        let total: i128 = env
+            .storage()
+            .instance()
+            .get(&ContributionKey::AssetTotal)
+            .unwrap_or(0);
+        env.storage()
+            .instance()
+            .set(&ContributionKey::AssetTotal, &(total + amount));
+        Ok(())
+    }
+
+    pub fn asset_total(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&ContributionKey::AssetTotal)
             .unwrap_or(0)
     }
 }
@@ -155,6 +189,47 @@ fn test_create_campaign_fails_with_invalid_end_time() {
 fn test_donate_fails_for_unaccepted_asset() {
     assert_eq!(require::check_asset_accepted(false), Err(Error::AssetNotAccepted));
     assert_eq!(require::check_asset_accepted(true), Ok(()));
+}
+
+#[test]
+fn test_unsupported_asset_transfer_does_not_record_a_contribution() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, AssetContributionLedger);
+    let client = AssetContributionLedgerClient::new(&env, &contract_id);
+    let donor = Address::generate(&env);
+    let unsupported = Address::generate(&env);
+
+    assert_eq!(
+        client.try_contribute(&unsupported, &donor, &100),
+        Err(Ok(Error::AssetNotAccepted))
+    );
+    assert_eq!(client.asset_total(), 0);
+}
+
+#[test]
+fn test_failed_asset_transfer_leaves_contribution_record_unchanged() {
+    let env = Env::default();
+    env.mock_all_auths_allowing_non_root_auth();
+    let token_admin = Address::generate(&env);
+    let donor = Address::generate(&env);
+    let asset = env
+        .register_stellar_asset_contract_v2(token_admin)
+        .address();
+    token::StellarAssetClient::new(&env, &asset).mint(&donor, &100);
+
+    let contract_id = env.register_contract(None, AssetContributionLedger);
+    let client = AssetContributionLedgerClient::new(&env, &contract_id);
+    env.as_contract(&contract_id, || {
+        asset_helpers::AssetHelper::set_asset_supported(&env, &asset, true);
+    });
+
+    client.contribute(&asset, &donor, &100);
+    assert_eq!(client.asset_total(), 100);
+    assert_eq!(token::Client::new(&env, &asset).balance(&donor), 0);
+
+    assert!(client.try_contribute(&asset, &donor, &1).is_err());
+    assert_eq!(client.asset_total(), 100);
 }
 
 #[test]
@@ -350,7 +425,7 @@ fn test_contribution_total_overflow_leaves_state_unchanged() {
     let contract_id = env.register_contract(None, ContributionLedger);
     let client = ContributionLedgerClient::new(&env, &contract_id);
 
-    assert_eq!(client.record(&i128::MAX), Ok(i128::MAX));
+    assert_eq!(client.record(&i128::MAX), i128::MAX);
     assert_eq!(client.try_record(&1), Err(Ok(Error::Overflow)));
     assert_eq!(client.total(), i128::MAX);
 }

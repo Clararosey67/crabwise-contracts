@@ -5,7 +5,7 @@ use soroban_sdk::{
 };
 
 use crate::errors::RateLimitError;
-use crate::types::RateLimitKey;
+use crate::types::{RateLimitKey, RateLimitRecord};
 use crate::{RateLimiter, RateLimiterClient};
 
 const WINDOW_LEDGERS: u32 = 100;
@@ -13,6 +13,7 @@ const WINDOW_LEDGERS: u32 = 100;
 struct Fixture<'a> {
     env: Env,
     client: RateLimiterClient<'a>,
+    contract_id: Address,
     admin: Address,
     artist: Address,
     client_account: Address,
@@ -30,6 +31,7 @@ fn setup<'a>() -> Fixture<'a> {
     Fixture {
         artist: Address::generate(&env),
         client_account: Address::generate(&env),
+        contract_id,
         env,
         client,
         admin,
@@ -38,7 +40,12 @@ fn setup<'a>() -> Fixture<'a> {
 
 impl Fixture<'_> {
     fn configure(&self, key: &RateLimitKey, limit: u32) {
-        self.client.set_limit(&self.admin, key, &limit, &WINDOW_LEDGERS);
+        self.configure_with_window(key, limit, WINDOW_LEDGERS);
+    }
+
+    fn configure_with_window(&self, key: &RateLimitKey, limit: u32, window_ledgers: u32) {
+        self.client
+            .set_limit(&self.admin, key, &limit, &window_ledgers);
     }
 
     fn check(&self, key: &RateLimitKey, who: &Address) -> Result<(), RateLimitError> {
@@ -145,6 +152,53 @@ fn set_limit_replaces_the_stored_configuration() {
     assert_eq!(config.window_ledgers, WINDOW_LEDGERS);
 }
 
+#[test]
+fn internally_inconsistent_limit_is_rejected() {
+    let f = setup();
+    let key = RateLimitKey::DisputesPerUser;
+    let err = f
+        .client
+        .try_set_limit(&f.admin, &key, &(WINDOW_LEDGERS + 1), &WINDOW_LEDGERS)
+        .err()
+        .unwrap()
+        .unwrap();
+    assert_eq!(err, RateLimitError::InvalidLimit);
+}
+
+#[test]
+fn invalid_configuration_leaves_the_existing_policy_active() {
+    let f = setup();
+    let key = RateLimitKey::CommissionsPerArtist;
+    f.configure(&key, 1);
+
+    let err = f
+        .client
+        .try_set_limit(&f.admin, &key, &0, &WINDOW_LEDGERS)
+        .err()
+        .unwrap()
+        .unwrap();
+    assert_eq!(err, RateLimitError::InvalidLimit);
+
+    let config = f.client.get_limit(&key).unwrap();
+    assert_eq!(config.limit, 1);
+    assert_eq!(config.window_ledgers, WINDOW_LEDGERS);
+    f.check(&key, &f.artist).unwrap();
+    assert_eq!(
+        f.check(&key, &f.artist).err().unwrap(),
+        RateLimitError::LimitExceeded
+    );
+}
+
+#[test]
+fn limit_equal_to_window_length_is_valid() {
+    let f = setup();
+    let key = RateLimitKey::EscrowsPerUser;
+    f.configure(&key, WINDOW_LEDGERS);
+    let config = f.client.get_limit(&key).unwrap();
+    assert_eq!(config.limit, WINDOW_LEDGERS);
+    assert_eq!(config.window_ledgers, WINDOW_LEDGERS);
+}
+
 // ── Window behaviour ─────────────────────────────────────────────────────────
 
 #[test]
@@ -188,36 +242,71 @@ fn limits_are_tracked_per_account() {
 }
 
 #[test]
-fn the_window_resets_once_it_has_elapsed() {
+fn window_rollover_is_deterministic_around_the_boundary() {
     let f = setup();
     let key = RateLimitKey::CommissionsPerArtist;
     f.configure(&key, 1);
+    f.env.ledger().with_mut(|l| l.sequence_number = 1_000);
 
     f.check(&key, &f.artist).unwrap();
+    let status = f.client.get_status(&key, &f.artist).unwrap();
+    assert_eq!(status.first_ledger, 1_000);
+    assert_eq!(status.count, 1);
+
+    f.advance(WINDOW_LEDGERS - 1);
+    assert_eq!(f.env.ledger().sequence(), 1_000 + WINDOW_LEDGERS - 1);
     assert_eq!(
         f.check(&key, &f.artist).err().unwrap(),
         RateLimitError::LimitExceeded
     );
+    let before = f.client.get_status(&key, &f.artist).unwrap();
+    assert_eq!(before.count, 1);
+    assert_eq!(before.first_ledger, 1_000);
+    assert_eq!(before.last_ledger, 1_000);
 
-    f.advance(WINDOW_LEDGERS + 1);
+    f.advance(1);
+    assert_eq!(f.env.ledger().sequence(), 1_000 + WINDOW_LEDGERS);
+    assert_eq!(
+        f.check(&key, &f.artist).err().unwrap(),
+        RateLimitError::LimitExceeded
+    );
+    let boundary = f.client.get_status(&key, &f.artist).unwrap();
+    assert_eq!(boundary.count, 1);
+    assert_eq!(boundary.first_ledger, 1_000);
+    assert_eq!(boundary.last_ledger, 1_000);
+
+    f.advance(1);
     f.check(&key, &f.artist).unwrap();
-    let status = f.client.get_status(&key, &f.artist).unwrap();
-    assert_eq!(status.count, 1);
-    assert_eq!(status.first_ledger, f.env.ledger().sequence());
+    let after = f.client.get_status(&key, &f.artist).unwrap();
+    assert_eq!(after.count, 1);
+    assert_eq!(after.first_ledger, 1_000 + WINDOW_LEDGERS + 1);
+    assert_eq!(after.last_ledger, 1_000 + WINDOW_LEDGERS + 1);
 }
 
 #[test]
-fn the_window_does_not_reset_early() {
+fn counter_overflow_is_rejected_without_resetting_the_window() {
     let f = setup();
-    let key = RateLimitKey::CommissionsPerArtist;
-    f.configure(&key, 1);
+    let key = RateLimitKey::EscrowsPerUser;
+    f.configure_with_window(&key, u32::MAX, u32::MAX);
+    f.env.ledger().with_mut(|l| l.sequence_number = 100);
 
-    f.check(&key, &f.artist).unwrap();
-    f.advance(WINDOW_LEDGERS);
+    let record = RateLimitRecord {
+        key,
+        account: f.artist.clone(),
+        count: u32::MAX,
+        first_ledger: 90,
+        last_ledger: 99,
+    };
+    let record_key = RateLimitRecord::key(key, f.artist.clone());
+    f.env.as_contract(&f.contract_id, || {
+        f.env.storage().persistent().set(&record_key, &record);
+    });
+
     assert_eq!(
         f.check(&key, &f.artist).err().unwrap(),
         RateLimitError::LimitExceeded
     );
+    assert_eq!(f.client.get_status(&key, &f.artist), Some(record));
 }
 
 // ── reset_limits ─────────────────────────────────────────────────────────────

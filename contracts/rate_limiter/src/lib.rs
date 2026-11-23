@@ -17,10 +17,10 @@
 //!
 //! ## Window semantics
 //!
-//! Counting is a fixed window: the first action of a window records
-//! `first_ledger`, and the window rolls over once `window_ledgers` have passed.
-//! Rejected attempts still advance the counter, so a client hammering a closed
-//! window cannot keep its position warm.
+//! Counting is a fixed window: the first action records `first_ledger`, and the
+//! window stays active through `first_ledger + window_ledgers`. The first action
+//! at the next ledger starts a fresh window with `count = 1`. A rejected action
+//! aborts the invocation, so its counter update is rolled back.
 
 #![no_std]
 #![allow(dead_code)]
@@ -104,6 +104,10 @@ fn all_keys() -> [RateLimitKey; 3] {
     ]
 }
 
+const fn window_has_rolled_over(elapsed: u32, window_ledgers: u32) -> bool {
+    elapsed > window_ledgers
+}
+
 #[contractimpl]
 impl RateLimiter {
     /// Initialize the rate limiter contract
@@ -138,25 +142,19 @@ impl RateLimiter {
     ) -> Result<(), RateLimitError> {
         admin.require_auth();
 
-        if limit == 0 {
-            return Err(RateLimitError::InvalidLimit);
-        }
-
-        if window_ledgers == 0 {
-            return Err(RateLimitError::InvalidWindow);
+        let config = RateLimitConfig {
+            limit,
+            window_ledgers,
+        };
+        if let Some(err) = config.validation_error() {
+            return Err(err);
         }
 
         let mut configs = env.storage().instance()
             .get(&types::DataKey::RateLimitConfig)
             .unwrap_or_else(|| Map::<RateLimitKey, RateLimitConfig>::new(&env));
 
-        configs.set(
-            key,
-            RateLimitConfig {
-                limit,
-                window_ledgers,
-            }
-        );
+        configs.set(key, config);
 
         env.storage().instance().set(&types::DataKey::RateLimitConfig, &configs);
 
@@ -207,10 +205,10 @@ impl RateLimiter {
     /// Check if an action is allowed for an account.
     ///
     /// On success the counter for `(key, account)` is incremented and persisted
-    /// with a TTL that ends when the current window rolls over. On rejection
-    /// the counter is still advanced — a rejected attempt is evidence of abuse —
-    /// and the numbers are published in the `rl_exceeded` event rather than in
-    /// the error, because a `#[contracterror]` variant cannot carry a payload.
+    /// with a TTL that covers the active window. On rejection the invocation
+    /// aborts, so the record stays unchanged and the numbers are published in
+    /// the `rl_exceeded` diagnostic event rather than in the error, because a
+    /// `#[contracterror]` variant cannot carry a payload.
     ///
     /// # Security note
     ///
@@ -253,14 +251,13 @@ impl RateLimiter {
         // current window, so the caller is still rate-limited.
         let elapsed = current_ledger.saturating_sub(record.first_ledger);
 
-        // Check if the window has expired
-        if elapsed > config.window_ledgers {
-            // Reset the window
+        let rolled_over = window_has_rolled_over(elapsed, config.window_ledgers);
+
+        if rolled_over {
             record.count = 1;
             record.first_ledger = current_ledger;
             record.last_ledger = current_ledger;
         } else {
-            // Increment the count
             record.count = record
                 .count
                 .checked_add(1)
@@ -268,19 +265,17 @@ impl RateLimiter {
             record.last_ledger = current_ledger;
         }
 
-        // Store the record with TTL
         env.storage().persistent().set(&record_key, &record);
 
-        // Set TTL to the end of the current window. Saturating because
-        // `elapsed` can exceed the window on the rollover branch above, where
-        // `first_ledger` has just been reset to the current ledger (elapsed 0),
-        // and defensively on any future ledger regression.
-        let ttl_ledgers = config.window_ledgers.saturating_sub(elapsed);
-        env.storage().persistent().extend_ttl(
-            &record_key,
-            ttl_ledgers,
-            ttl_ledgers,
-        );
+        let window_span = config.window_ledgers.saturating_add(1);
+        let ttl_ledgers = if rolled_over {
+            window_span
+        } else {
+            window_span.saturating_sub(elapsed)
+        };
+        env.storage()
+            .persistent()
+            .extend_ttl(&record_key, ttl_ledgers, ttl_ledgers);
 
         // Check if the limit has been exceeded
         if record.count > config.limit {
