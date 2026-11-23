@@ -409,6 +409,23 @@ impl CreatorFund {
             &proposal.amount,
         );
 
+        // Stable allocation event (#95): the fund and proposal are indexed so
+        // an indexer can find every payout for either without decoding the
+        // payload. Emitted only after the payout succeeded, so its fields
+        // always agree with the `Allocation` record written above.
+        env.events().publish(
+            (
+                symbol_short!("allocated"),
+                proposal.fund_id.clone(),
+                proposal_id.clone(),
+            ),
+            (
+                proposal.recipient.clone(),
+                proposal.amount,
+                env.ledger().sequence(),
+            ),
+        );
+
         env.events().publish(
             (symbol_short!("executed"),),
             (proposal_id, proposal.recipient, proposal.amount),
