@@ -411,6 +411,98 @@ fn reserve_floor_is_enforced() {
 }
 
 #[test]
+fn allocation_equal_to_the_balance_empties_the_fund() {
+    let f = setup();
+    f.create(FundType::GrantPool, rule(10_000, 0, 5000));
+    f.client.contribute(&f.fund_id, &f.alice, &1_000);
+    f.propose(1_000);
+    f.client.vote(&f.proposal_id, &f.alice, &true);
+    f.close_voting();
+    assert_eq!(
+        f.client.finalize_proposal(&f.proposal_id),
+        ProposalStatus::Approved
+    );
+
+    f.client.execute_allocation(&f.proposal_id);
+
+    let fund = f.client.get_fund(&f.fund_id);
+    assert_eq!(fund.balance, 0);
+    assert_eq!(fund.total_allocated, 1_000);
+    assert_eq!(f.balance(&f.grantee), 1_000);
+}
+
+#[test]
+fn allocation_above_the_available_balance_is_rejected() {
+    let f = setup();
+    f.create(FundType::GrantPool, rule(10_000, 0, 5000));
+    f.client.contribute(&f.fund_id, &f.alice, &1_000);
+
+    // One unit more than the fund holds cannot be allocated.
+    let err = f
+        .client
+        .try_propose_allocation(
+            &f.proposal_id,
+            &f.fund_id,
+            &f.alice,
+            &f.grantee,
+            &1_001,
+            &String::from_str(&f.env, "over balance"),
+        )
+        .err()
+        .unwrap()
+        .unwrap();
+    assert_eq!(err, FundError::ExceedsAllocationLimit);
+
+    let fund = f.client.get_fund(&f.fund_id);
+    assert_eq!(fund.balance, 1_000);
+    assert_eq!(fund.total_allocated, 0);
+}
+
+#[test]
+fn a_second_approved_allocation_cannot_overdraw_the_fund() {
+    let f = setup();
+    f.create(FundType::GrantPool, rule(10_000, 0, 5000));
+    f.client.contribute(&f.fund_id, &f.alice, &1_000);
+
+    // Two proposals each fit the fund on their own, but not together.
+    f.propose(1_000);
+    let second_id = Bytes::from_slice(&f.env, b"prop-002");
+    f.client.propose_allocation(
+        &second_id,
+        &f.fund_id,
+        &f.alice,
+        &f.grantee,
+        &1_000,
+        &String::from_str(&f.env, "second grant"),
+    );
+    f.client.vote(&f.proposal_id, &f.alice, &true);
+    f.client.vote(&second_id, &f.alice, &true);
+    f.close_voting();
+    assert_eq!(
+        f.client.finalize_proposal(&f.proposal_id),
+        ProposalStatus::Approved
+    );
+    assert_eq!(
+        f.client.finalize_proposal(&second_id),
+        ProposalStatus::Approved
+    );
+
+    f.client.execute_allocation(&f.proposal_id);
+    let err = f
+        .client
+        .try_execute_allocation(&second_id)
+        .err()
+        .unwrap()
+        .unwrap();
+    assert_eq!(err, FundError::ExceedsAllocationLimit);
+
+    let fund = f.client.get_fund(&f.fund_id);
+    assert_eq!(fund.balance, 0);
+    assert_eq!(fund.total_allocated, 1_000);
+    assert_eq!(f.balance(&f.grantee), 1_000);
+}
+
+#[test]
 fn rule_is_rechecked_at_execution_time() {
     let f = setup();
     f.create(FundType::GrantPool, rule(10_000, 0, 5000));

@@ -99,7 +99,14 @@ fn voting_power(env: &Env, fund_id: &Bytes, account: &Address) -> i128 {
 }
 
 /// A payout must fit under the per-allocation cap and leave the reserve intact.
+///
+/// The remaining balance is derived with checked arithmetic, so an allocation
+/// larger than the funds on hand is rejected instead of wrapping the balance.
 fn check_distribution_rule(fund: &Fund, amount: i128) -> Result<(), FundError> {
+    let remaining = fund
+        .balance
+        .checked_sub(amount)
+        .ok_or(FundError::ExceedsAllocationLimit)?;
     let cap = fund
         .balance
         .checked_mul(fund.rule.max_allocation_bps as i128)
@@ -108,7 +115,7 @@ fn check_distribution_rule(fund: &Fund, amount: i128) -> Result<(), FundError> {
     if amount > cap {
         return Err(FundError::ExceedsAllocationLimit);
     }
-    if fund.balance - amount < fund.rule.min_reserve {
+    if remaining < fund.rule.min_reserve {
         return Err(FundError::ReserveBreached);
     }
     Ok(())
@@ -373,7 +380,10 @@ impl CreatorFund {
         let mut fund = load_fund(&env, &proposal.fund_id)?;
         check_distribution_rule(&fund, proposal.amount)?;
 
-        fund.balance -= proposal.amount;
+        fund.balance = fund
+            .balance
+            .checked_sub(proposal.amount)
+            .ok_or(FundError::ArithmeticOverflow)?;
         fund.total_allocated = fund
             .total_allocated
             .checked_add(proposal.amount)
