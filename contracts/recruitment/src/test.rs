@@ -1,5 +1,5 @@
 extern crate std;
-use soroban_sdk::{testutils::Address as _, Address, Bytes, Env, String};
+use soroban_sdk::{testutils::Address as _, testutils::Ledger as _, Address, Bytes, Env, String};
 
 use crate::errors::RecruitmentError;
 use crate::types::{JobStatus, Stage};
@@ -38,12 +38,17 @@ fn setup<'a>() -> Fixture<'a> {
 
 impl Fixture<'_> {
     fn post(&self, openings: u32) {
+        self.post_until(openings, self.env.ledger().sequence() + 100);
+    }
+
+    fn post_until(&self, openings: u32, deadline_ledger: u32) {
         self.client.post_job(
             &self.job_id,
             &self.employer,
             &String::from_str(&self.env, "Album cover illustrator"),
             &5_000,
             &openings,
+            &deadline_ledger,
         );
     }
 
@@ -70,6 +75,7 @@ fn post_job_creates_open_posting() {
     assert_eq!(job.status, JobStatus::Open);
     assert_eq!(job.openings, 1);
     assert_eq!(job.applicant_count, 0);
+    assert_eq!(job.deadline_ledger, f.env.ledger().sequence() + 100);
 }
 
 #[test]
@@ -84,6 +90,7 @@ fn duplicate_job_id_is_rejected() {
             &String::from_str(&f.env, "duplicate"),
             &5_000,
             &1,
+            &(f.env.ledger().sequence() + 100),
         )
         .err()
         .unwrap()
@@ -95,9 +102,10 @@ fn duplicate_job_id_is_rejected() {
 fn invalid_posting_terms_are_rejected() {
     let f = setup();
     let title = String::from_str(&f.env, "bad posting");
+    let deadline = f.env.ledger().sequence() + 100;
     assert_eq!(
         f.client
-            .try_post_job(&f.job_id, &f.employer, &title, &0, &1)
+            .try_post_job(&f.job_id, &f.employer, &title, &0, &1, &deadline)
             .err()
             .unwrap()
             .unwrap(),
@@ -105,12 +113,59 @@ fn invalid_posting_terms_are_rejected() {
     );
     assert_eq!(
         f.client
-            .try_post_job(&f.job_id, &f.employer, &title, &5_000, &0)
+            .try_post_job(&f.job_id, &f.employer, &title, &5_000, &0, &deadline)
             .err()
             .unwrap()
             .unwrap(),
         RecruitmentError::InvalidOpenings
     );
+}
+
+#[test]
+fn past_and_current_deadlines_are_rejected() {
+    let f = setup();
+    let title = String::from_str(&f.env, "bad deadline");
+    let now = f.env.ledger().sequence();
+    for deadline in [now, now.saturating_sub(1)] {
+        assert_eq!(
+            f.client
+                .try_post_job(&f.job_id, &f.employer, &title, &5_000, &1, &deadline)
+                .err()
+                .unwrap()
+                .unwrap(),
+            RecruitmentError::InvalidDeadline
+        );
+    }
+}
+
+#[test]
+fn future_deadline_is_stored_and_bounds_intake() {
+    let f = setup();
+    let deadline = f.env.ledger().sequence() + 5;
+    f.post_until(1, deadline);
+    assert_eq!(f.client.get_job(&f.job_id).deadline_ledger, deadline);
+
+    // Applications are still accepted on the deadline ledger itself.
+    f.env.ledger().with_mut(|ledger| {
+        ledger.sequence_number = deadline;
+    });
+    f.apply(&Address::generate(&f.env));
+
+    f.env.ledger().with_mut(|ledger| {
+        ledger.sequence_number = deadline + 1;
+    });
+    let err = f
+        .client
+        .try_apply_for_job(
+            &f.job_id,
+            &Address::generate(&f.env),
+            &String::from_str(&f.env, "ipfs://late"),
+            &900,
+        )
+        .err()
+        .unwrap()
+        .unwrap();
+    assert_eq!(err, RecruitmentError::JobNotOpen);
 }
 
 #[test]

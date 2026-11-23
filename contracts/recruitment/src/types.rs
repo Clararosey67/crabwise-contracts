@@ -55,6 +55,9 @@ pub struct Job {
     pub applicant_count: u32,
     pub status: JobStatus,
     pub posted_ledger: u32,
+    /// Last ledger at which applications are still accepted. Posting closes
+    /// automatically once the ledger sequence passes this value.
+    pub deadline_ledger: u32,
 }
 
 #[contracttype]
