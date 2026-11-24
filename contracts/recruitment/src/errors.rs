@@ -19,6 +19,7 @@ pub enum RecruitmentError {
     EmployerCannotApply = 13,
     TooManyApplicants = 14,
     NotHired = 15,
+    InvalidDeadline = 16,
 }
 
 impl core::fmt::Display for RecruitmentError {
@@ -39,6 +40,7 @@ impl core::fmt::Display for RecruitmentError {
             Self::EmployerCannotApply => write!(f, "employer cannot apply to own posting"),
             Self::TooManyApplicants => write!(f, "applicant limit reached"),
             Self::NotHired => write!(f, "applicant has not been hired"),
+            Self::InvalidDeadline => write!(f, "deadline must be in the future"),
         }
     }
 }
@@ -60,5 +62,6 @@ pub fn get_suggestion(error: RecruitmentError) -> Symbol {
         RecruitmentError::EmployerCannotApply => symbol_short!("SELF_APP"),
         RecruitmentError::TooManyApplicants => symbol_short!("TOO_MANY"),
         RecruitmentError::NotHired => symbol_short!("NOT_HIRED"),
+        RecruitmentError::InvalidDeadline => symbol_short!("BAD_DL"),
     }
 }

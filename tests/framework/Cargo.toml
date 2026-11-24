@@ -14,4 +14,3 @@ dao = { path = "../../contracts/dao", features = ["testutils"], version = "0.1.0
 ecosystem_funding = { path = "../../contracts/ecosystem_funding", features = ["testutils"], version = "0.1.0" }
 licensing = { path = "../../contracts/licensing", features = ["testutils"], version = "0.1.0" }
 campaign_instance = { path = "../../contracts/campaign_instance", features = ["testutils"] }
-ecosystem_funding = { path = "../../contracts/ecosystem_funding", features = ["testutils"] }

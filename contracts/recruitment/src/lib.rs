@@ -143,6 +143,7 @@ impl Recruitment {
         title: String,
         budget: i128,
         openings: u32,
+        deadline_ledger: u32,
     ) -> Result<(), RecruitmentError> {
         require_initialized(&env)?;
         employer.require_auth();
@@ -159,6 +160,10 @@ impl Recruitment {
         if openings == 0 {
             return Err(RecruitmentError::InvalidOpenings);
         }
+        let posted_ledger = env.ledger().sequence();
+        if deadline_ledger <= posted_ledger {
+            return Err(RecruitmentError::InvalidDeadline);
+        }
         let job = Job {
             id: job_id.clone(),
             employer: employer.clone(),
@@ -168,7 +173,8 @@ impl Recruitment {
             filled: 0,
             applicant_count: 0,
             status: JobStatus::Open,
-            posted_ledger: env.ledger().sequence(),
+            posted_ledger,
+            deadline_ledger,
         };
         save_job(&env, &job);
         env.events()
@@ -200,6 +206,9 @@ impl Recruitment {
         applicant.require_auth();
         let mut job = load_job(&env, &job_id)?;
         if job.status != JobStatus::Open {
+            return Err(RecruitmentError::JobNotOpen);
+        }
+        if env.ledger().sequence() > job.deadline_ledger {
             return Err(RecruitmentError::JobNotOpen);
         }
         if job.employer == applicant {
