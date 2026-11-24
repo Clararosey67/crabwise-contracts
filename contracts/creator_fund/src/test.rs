@@ -1,7 +1,8 @@
 extern crate std;
 use soroban_sdk::{
-    testutils::{Address as _, Ledger},
-    token, Address, Bytes, Env, String,
+    symbol_short,
+    testutils::{Address as _, Events as _, Ledger},
+    token, Address, Bytes, Env, String, Symbol, TryFromVal,
 };
 
 use crate::errors::FundError;
@@ -564,6 +565,74 @@ fn unknown_fund_and_proposal_are_reported() {
             .unwrap(),
         FundError::ProposalNotFound
     );
+}
+
+// ── Allocation events (#95) ─────────────────────────────────────────────────
+
+/// Finds the `allocated` event for `fund_id`/`proposal_id` and returns its
+/// decoded payload. The fund and proposal must be topics, not payload fields.
+fn allocated_event(
+    env: &Env,
+    fund_id: &Bytes,
+    proposal_id: &Bytes,
+) -> Option<(Address, i128, u32)> {
+    for (_contract, topics, data) in env.events().all().iter() {
+        if topics.len() != 3 {
+            continue;
+        }
+        // Other contracts (the token, for instance) log into the same event
+        // stream, so match the name before decoding our own topics.
+        let name: Symbol = match TryFromVal::try_from_val(env, &topics.get(0).unwrap()) {
+            Ok(name) => name,
+            Err(_) => continue,
+        };
+        if name != symbol_short!("allocated") {
+            continue;
+        }
+        let topic_fund: Bytes = TryFromVal::try_from_val(env, &topics.get(1).unwrap()).unwrap();
+        let topic_proposal: Bytes = TryFromVal::try_from_val(env, &topics.get(2).unwrap()).unwrap();
+        if &topic_fund == fund_id && &topic_proposal == proposal_id {
+            return Some(TryFromVal::try_from_val(env, &data).unwrap());
+        }
+    }
+    None
+}
+
+#[test]
+fn execute_allocation_emits_an_allocated_event_matching_the_stored_record() {
+    let f = setup();
+    f.fund_with_capital();
+    f.propose(500);
+    f.client.vote(&f.proposal_id, &f.alice, &true);
+    f.close_voting();
+    f.client.finalize_proposal(&f.proposal_id);
+    f.client.execute_allocation(&f.proposal_id);
+
+    let stored = f.client.get_allocations(&f.fund_id).get(0).unwrap();
+    let (recipient, amount, ledger) = allocated_event(&f.env, &f.fund_id, &f.proposal_id)
+        .expect("allocated event was not emitted");
+
+    assert_eq!(recipient, stored.recipient);
+    assert_eq!(amount, stored.amount);
+    assert_eq!(ledger, stored.ledger);
+    assert_eq!(stored.proposal_id, f.proposal_id);
+}
+
+#[test]
+fn refused_allocation_emits_no_allocated_event() {
+    let f = setup();
+    f.fund_with_capital();
+    f.propose(500);
+
+    // Approval has not happened yet, so execution is refused.
+    let err = f
+        .client
+        .try_execute_allocation(&f.proposal_id)
+        .err()
+        .unwrap()
+        .unwrap();
+    assert_eq!(err, FundError::ProposalNotApproved);
+    assert!(allocated_event(&f.env, &f.fund_id, &f.proposal_id).is_none());
 }
 
 #[test]
